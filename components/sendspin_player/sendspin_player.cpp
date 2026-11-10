@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <new>
@@ -52,6 +53,7 @@
 #include "sendspin/player_role.h"
 
 extern "C" {
+#include "event_log.h"
 #include "network_interface.h"
 // main.c: DAC enable / mute through the board HAL; also drives the status LED
 void audio_set_mute(bool mute);
@@ -521,6 +523,17 @@ class Player : public sendspin::PlayerRoleListener,
       ESP_LOGE(TAG, "server sent a format this player did not offer");
     }
 
+    if (!stream_active_) {
+      char khz[16];
+      std::string codec = p.codec ? codec_name(*p.codec) : "?";
+      for (auto &c : codec) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+      }
+      event_log_addf(EVENT_SRC_SENDSPIN, EVENT_INFO,
+                     "Stream started: %s, %s, %u-bit", codec.c_str(),
+                     event_log_khz(khz, sizeof(khz), rate),
+                     (unsigned)p.bit_depth.value_or(0));
+    }
     stream_active_ = true;
     release_at_us_ = 0;
     output_failed_ = false;  // a new stream: no failure seen for it yet
@@ -541,6 +554,8 @@ class Player : public sendspin::PlayerRoleListener,
     }
     if (!port_free) {
       ESP_LOGW(TAG, "snapcast still has the output; retrying");
+      event_log_add(EVENT_SRC_SENDSPIN, EVENT_WARN,
+                    "Waiting for snapcast to release the output");
       retry_at_us_ = esp_timer_get_time() + kRetryUs;
       return;
     }
@@ -549,6 +564,7 @@ class Player : public sendspin::PlayerRoleListener,
 
   void on_stream_end() override {
     ESP_LOGI(TAG, "stream end");
+    event_log_add(EVENT_SRC_SENDSPIN, EVENT_INFO, "Stream ended");
     stream_active_ = false;
     // keep the output a little longer in case the next stream follows
     release_at_us_ = esp_timer_get_time() + kReleaseDelayUs;
@@ -594,10 +610,16 @@ class Player : public sendspin::PlayerRoleListener,
     ESP_LOGW(TAG, "pairing with server %s failed", server_id.c_str());
   }
 
+  // every new connection (and a re-handshake after pairing) reports its trust
   void on_trust_changed(sendspin::ConnectionTrust trust) override {
     trust_ = trust;
-    ESP_LOGI(TAG, "server connected (%s)",
-             trust == sendspin::ConnectionTrust::USER ? "paired" : "unpaired");
+    const bool paired = trust == sendspin::ConnectionTrust::USER;
+    ESP_LOGI(TAG, "server connected (%s)", paired ? "paired" : "unpaired");
+    auto info = client_->get_server_information();
+    server_name_ = info ? info->name : std::string();
+    event_log_addf(EVENT_SRC_SENDSPIN, EVENT_INFO, "Server %s connected (%s)",
+                   server_name_.empty() ? "?" : server_name_.c_str(),
+                   paired ? "paired" : "unpaired");
   }
 
   // Deltas (an absent field is unchanged). Kept here rather than read from
@@ -665,6 +687,8 @@ class Player : public sendspin::PlayerRoleListener,
       holding_ = false;
       player_reclaim_output();
       ESP_LOGI(TAG, "output handed back to snapcast");
+      event_log_add(EVENT_SRC_SENDSPIN, EVENT_INFO,
+                    "Handed the output back to snapcast");
     }
 
     if (settings_dirty_ && !out_->is_open()) {
@@ -681,6 +705,8 @@ class Player : public sendspin::PlayerRoleListener,
     int64_t now = esp_timer_get_time();
     bool connected = client->is_connected();
     if (!connected && was_connected_) {
+      event_log_addf(EVENT_SRC_SENDSPIN, EVENT_INFO, "Server %s disconnected",
+                     server_name_.empty() ? "?" : server_name_.c_str());
       // nothing in the library signals a disconnect: forget what belonged
       // to that server (trust is reported again by every new connection)
       have_group_ = false;
@@ -739,6 +765,7 @@ class Player : public sendspin::PlayerRoleListener,
         stream_active_ && holding_ && !st.output_open && !st.output_failed;
     st.volume = volume_;
     st.muted = muted_;
+    st.stack_free = static_cast<uint32_t>(uxTaskGetStackHighWaterMark(nullptr));
 
     taskENTER_CRITICAL(&g_status_mux);
     g_status = st;
@@ -751,9 +778,13 @@ class Player : public sendspin::PlayerRoleListener,
     if (out_->open(kSampleRate)) {
       audio_dac_enable(true);
       audio_set_mute(false);
+      event_log_add(EVENT_SRC_SENDSPIN, EVENT_INFO,
+                    "Took the audio output (snapcast paused)");
     } else {
       output_failed_ = true;  // snapcast let go; our own I2S setup failed
       retry_at_us_ = esp_timer_get_time() + kRetryUs;
+      event_log_add(EVENT_SRC_SENDSPIN, EVENT_ERROR,
+                    "Could not open the audio output");
     }
   }
 
@@ -795,6 +826,7 @@ class Player : public sendspin::PlayerRoleListener,
   bool was_connected_ = false;
   bool have_group_ = false;
   std::string group_server_id_;
+  std::string server_name_;  // for the disconnect event
   std::string group_name_;
   bool group_playing_ = false;
   bool output_failed_ = false;

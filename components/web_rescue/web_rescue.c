@@ -130,6 +130,15 @@ const char *web_rescue_sta_ip(void) { return s_sta_ip; }
 const char *web_rescue_ap_ssid(void) { return s_ap_ssid; }
 httpd_handle_t web_rescue_httpd(void) { return s_httpd; }
 
+// web_rescue_note default: does nothing (board-probe has no event log);
+// snapclient's main defines the real one
+__attribute__((weak)) void web_rescue_note(bool restart, bool problem,
+                                           const char *text) {
+  (void)restart;
+  (void)problem;
+  (void)text;
+}
+
 static void reboot_cb(void *arg) { esp_restart(); }
 
 static void reboot_soon(void) {
@@ -541,6 +550,10 @@ static esp_err_t update_post(httpd_req_t *req) {
                                        : esp_err_to_name(err));
   }
   ESP_LOGI(TAG, "update written to %s, rebooting", target->label);
+  char note[64];
+  snprintf(note, sizeof(note), "Installed new firmware into %s; restarting",
+           target->label);
+  web_rescue_note(true, false, note);
   send_result(req, true, "installed, rebooting into the new firmware");
   reboot_soon();
   return ESP_OK;
@@ -563,6 +576,10 @@ static esp_err_t boot_post(httpd_req_t *req) {
   if (err != ESP_OK) return send_result(req, false, esp_err_to_name(err));
   ESP_LOGI(TAG, "boot partition set to %s ('%s'), rebooting", label,
            d.project_name);
+  char note[64];
+  snprintf(note, sizeof(note), "Switching to the firmware in %s; restarting",
+           label);
+  web_rescue_note(true, false, note);
   send_result(req, true, "rebooting into the selected firmware");
   reboot_soon();
   return ESP_OK;
@@ -570,6 +587,7 @@ static esp_err_t boot_post(httpd_req_t *req) {
 
 static esp_err_t reboot_post(httpd_req_t *req) {
   if (!web_rescue_allow(req, true)) return ESP_OK;
+  web_rescue_note(true, false, "Restart requested from the rescue page");
   send_result(req, true, "rebooting");
   reboot_soon();
   return ESP_OK;

@@ -17,7 +17,10 @@
 
 #include "dsp_processor_settings.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
+#include "esp_timer.h"
+#include "event_log.h"
 #if CONFIG_RESCUE_MODE_ENABLE
 #include "web_rescue.h"
 #endif
@@ -721,6 +724,104 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
 }
 
 /*
+ * JSON string escaping for the event texts (server names come from the
+ * network). Writes at most size-1 characters plus NUL.
+ */
+static void json_escape(char *dst, size_t size, const char *src) {
+	size_t o = 0;
+	for (; *src != '\0' && o + 7 < size; src++) {
+		unsigned char c = (unsigned char)*src;
+		if (c == '"' || c == '\\') {
+			dst[o++] = '\\';
+			dst[o++] = (char)c;
+		} else if (c < 0x20) {
+			o += snprintf(dst + o, size - o, "\\u%04x", c);
+		} else {
+			dst[o++] = (char)c;
+		}
+	}
+	dst[o] = '\0';
+}
+
+/*
+ * GET /api/events: the event log, oldest first, and the last few starts,
+ * newest first. The Status tab fetches it when /api/status reports a change.
+ * Times are milliseconds since the start of the run ("boot") each belongs
+ * to. Streamed one entry at a time to keep the memory use small; 503 when
+ * the log is busy, so the page tries again.
+ */
+static esp_err_t events_get_handler(httpd_req_t *req) {
+	ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
+
+	// ~5 KB, short-lived: PSRAM where there is some
+	event_log_entry_t *entries = heap_caps_malloc(
+		EVENT_LOG_SIZE * sizeof(event_log_entry_t),
+		MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	if (entries == NULL) {
+		entries = malloc(EVENT_LOG_SIZE * sizeof(event_log_entry_t));
+	}
+	event_log_run_t runs[EVENT_LOG_RUNS];
+	int n = entries != NULL ? event_log_snapshot(entries, EVENT_LOG_SIZE) : -1;
+	size_t nruns = n >= 0 ? event_log_runs(runs, EVENT_LOG_RUNS) : 0;
+
+	// no CORS header: same reasoning as /api/status
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	if (n < 0) {
+		free(entries);
+		httpd_resp_set_status(req, "503 Service Unavailable");
+		httpd_resp_set_type(req, "text/plain");
+		return httpd_resp_sendstr(req, "event log busy");
+	}
+	httpd_resp_set_type(req, "application/json");
+
+	char text[EVENT_LOG_TEXT_LEN * 6 + 1];
+	char buf[EVENT_LOG_TEXT_LEN * 6 + 160];
+	esp_err_t err;
+	snprintf(buf, sizeof(buf),
+			 "{\"boot\":%lu,\"explained\":%s,\"uptime_ms\":%lld,"
+			 "\"changes\":%lu,\"runs\":[",
+			 (unsigned long)event_log_boot(),
+			 event_log_start_explained() ? "true" : "false",
+			 (long long)(esp_timer_get_time() / 1000),
+			 (unsigned long)event_log_last_change());
+	err = httpd_resp_sendstr_chunk(req, buf);
+	for (size_t i = 0; err == ESP_OK && i < nruns; i++) {
+		snprintf(buf, sizeof(buf),
+				 "%s{\"boot\":%lu,\"reason\":\"%s\",\"explained\":%s,"
+				 "\"last_ms\":%lld}",
+				 i ? "," : "", (unsigned long)runs[i].boot,
+				 event_log_reset_reason_text(
+					 (esp_reset_reason_t)runs[i].reset_reason),
+				 runs[i].explained ? "true" : "false",
+				 (long long)(runs[i].last_us / 1000));
+		err = httpd_resp_sendstr_chunk(req, buf);
+	}
+	if (err == ESP_OK) {
+		err = httpd_resp_sendstr_chunk(req, "],\"entries\":[");
+	}
+	for (int i = 0; err == ESP_OK && i < n; i++) {
+		const event_log_entry_t *e = &entries[i];
+		json_escape(text, sizeof(text), e->text);
+		snprintf(buf, sizeof(buf),
+				 "%s{\"seq\":%lu,\"boot\":%lu,\"t_ms\":%lld,\"src\":\"%s\","
+				 "\"level\":\"%s\",\"n\":%u,\"text\":\"%s\"}",
+				 i ? "," : "", (unsigned long)e->seq, (unsigned long)e->boot,
+				 (long long)(e->uptime_us / 1000),
+				 event_log_source_name(e->source),
+				 event_log_level_name(e->level), (unsigned)e->count, text);
+		err = httpd_resp_sendstr_chunk(req, buf);
+	}
+	if (err == ESP_OK) {
+		err = httpd_resp_sendstr_chunk(req, "]}");
+	}
+	if (err == ESP_OK) {
+		err = httpd_resp_sendstr_chunk(req, NULL);  // end of the response
+	}
+	free(entries);
+	return err;
+}
+
+/*
  * favicon get handler
  * Returns 404 since we don't have a favicon
  */
@@ -746,6 +847,9 @@ static esp_err_t restart_post_handler(httpd_req_t *req) {
 	ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
 	set_cors_headers(req);
 
+	event_log_note_restart(EVENT_INFO,
+						   "Restart requested from the settings page");
+
 	// Send immediate response before restarting
 	httpd_resp_set_status(req, "200 OK");
 	httpd_resp_sendstr(req, "restarting");
@@ -767,7 +871,7 @@ static esp_err_t restart_post_handler(httpd_req_t *req) {
  * it from a browser. */
 static void rescue_task(void *pv) {
 	vTaskDelay(pdMS_TO_TICKS(300));  // let the response go out
-	rescue_mode_request("requested over the web UI");
+	rescue_mode_request("Rescue mode requested from the settings page");
 }
 
 static esp_err_t rescue_post_handler(httpd_req_t *req) {
@@ -1213,6 +1317,14 @@ esp_err_t start_server(const char *base_path, int port) {
 		.handler = status_get_handler,
 	};
 	httpd_register_uri_handler(server, &_status_get_handler);
+
+	/* URI handler for the Status tab's event log */
+	httpd_uri_t _events_get_handler = {
+		.uri = "/api/events",
+		.method = HTTP_GET,
+		.handler = events_get_handler,
+	};
+	httpd_register_uri_handler(server, &_events_get_handler);
 
 	/* URI handler for favicon.ico */
 	httpd_uri_t _favicon_get_handler = {

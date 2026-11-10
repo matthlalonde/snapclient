@@ -2,7 +2,9 @@
 //   output    which source owns the I2S output (AUX and optical) and its format
 //   snapcast  server connection, stream, sync health
 //   sendspin  server, group, stream, volume
-//   device    firmware, uptime, last reset, WiFi, memory
+//   device    firmware, uptime, last reset, WiFi, memory, stack headroom
+//   events    a change counter for the event log (GET /api/events)
+// It also records the start-up and WiFi events in the event log.
 // Each section runs on the web server's task and only copies snapshots that
 // the audio tasks publish, so a page refresh never waits on audio work.
 
@@ -13,6 +15,7 @@
 
 #include "cJSON.h"
 #include "esp_app_desc.h"
+#include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -20,6 +23,10 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "event_log.h"
+#include "web_rescue.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "network_interface.h"
 #include "player.h"
 #include "sdkconfig.h"
@@ -37,43 +44,6 @@ static double seconds_since(int64_t then_us, int64_t now_us) {
   return (double)((now_us - then_us) / 1000000);
 }
 
-static const char *reset_reason_text(esp_reset_reason_t r) {
-  switch (r) {
-    case ESP_RST_POWERON:
-      return "power-on";
-    case ESP_RST_EXT:
-      return "reset pin";
-    case ESP_RST_SW:
-      return "restart (software)";
-    case ESP_RST_PANIC:
-      return "crash (panic)";
-    case ESP_RST_INT_WDT:
-      return "crash (interrupt watchdog)";
-    case ESP_RST_TASK_WDT:
-      return "crash (task watchdog)";
-    case ESP_RST_WDT:
-      return "crash (watchdog)";
-    case ESP_RST_DEEPSLEEP:
-      return "wake from deep sleep";
-    case ESP_RST_BROWNOUT:
-      return "brownout (supply voltage dip)";
-    case ESP_RST_SDIO:
-      return "SDIO reset";
-    case ESP_RST_USB:
-      return "USB reset";
-    case ESP_RST_JTAG:
-      return "JTAG reset";
-    case ESP_RST_EFUSE:
-      return "eFuse error";
-    case ESP_RST_PWR_GLITCH:
-      return "power glitch";
-    case ESP_RST_CPU_LOCKUP:
-      return "crash (CPU lockup)";
-    default:
-      return "unknown";
-  }
-}
-
 static void device_section(cJSON *o) {
   const esp_app_desc_t *app = esp_app_get_description();
   const esp_partition_t *running = esp_ota_get_running_partition();
@@ -88,7 +58,8 @@ static void device_section(cJSON *o) {
     cJSON_AddStringToObject(o, "slot", running->label);
   }
   cJSON_AddNumberToObject(o, "uptime_s", seconds_since(0, esp_timer_get_time()));
-  cJSON_AddStringToObject(o, "reset_reason", reset_reason_text(esp_reset_reason()));
+  cJSON_AddStringToObject(o, "reset_reason",
+                          event_log_reset_reason_text(esp_reset_reason()));
 
   esp_netif_ip_info_t ip = {0};
   if (network_if_get_ip(&ip) && ip.ip.addr != 0) {
@@ -117,6 +88,33 @@ static void device_section(cJSON *o) {
                           heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
   cJSON_AddNumberToObject(o, "heap_min",
                           heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+  // lowest free stack seen per task, in bytes: headroom for the event log's
+  // formatting and future changes. Looked up by name: only tasks that are
+  // never deleted and have a unique name (Sendspin also runs an "httpd").
+  static const char *const tasks[] = {"sys_evt", "http", "ss_i2s", "tiT"};
+  cJSON *stacks = cJSON_AddObjectToObject(o, "stack_free");
+  if (stacks != NULL) {
+    for (size_t i = 0; i < sizeof(tasks) / sizeof(tasks[0]); i++) {
+      TaskHandle_t t = xTaskGetHandle(tasks[i]);
+      if (t != NULL) {
+        cJSON_AddNumberToObject(stacks, tasks[i], uxTaskGetStackHighWaterMark(t));
+      }
+    }
+    // this runs on the settings page's own server task
+    cJSON_AddNumberToObject(stacks, "httpd", uxTaskGetStackHighWaterMark(NULL));
+    // the player measures itself (its task comes and goes)
+    snapcast_status_t sc;
+    snapcast_status_get(&sc);
+    if (sc.player_stack_free != 0) {
+      cJSON_AddNumberToObject(stacks, "player", sc.player_stack_free);
+    }
+    // and so does the Sendspin task (it deletes itself if it can't start)
+    sendspin_status_t ss;
+    if (sendspin_player_get_status(&ss) && ss.stack_free != 0) {
+      cJSON_AddNumberToObject(stacks, "sendspin", ss.stack_free);
+    }
+  }
+
   size_t psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
   if (psram > 0) {
     cJSON_AddNumberToObject(o, "psram_size", psram);
@@ -273,6 +271,161 @@ static void output_section(cJSON *o) {
   cJSON_AddStringToObject(o, "source", "none");
 }
 
+// The page fetches /api/events only when these change
+static void events_section(cJSON *o) {
+  cJSON_AddNumberToObject(o, "boot", event_log_boot());
+  cJSON_AddNumberToObject(o, "changes", event_log_last_change());
+}
+
+void status_events_boot(void) {
+  esp_reset_reason_t rr = esp_reset_reason();
+  event_level_t level = EVENT_INFO;
+  const char *note = "";
+  switch (rr) {
+    case ESP_RST_POWERON:
+    case ESP_RST_DEEPSLEEP:
+      break;
+    case ESP_RST_SW:
+      // deliberate restarts log their reason first (event_log_restart)
+      if (!event_log_start_explained()) {
+        level = EVENT_WARN;
+        note = ", no reason logged";
+      }
+      break;
+    case ESP_RST_PANIC:
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:
+    case ESP_RST_BROWNOUT:
+    case ESP_RST_CPU_LOCKUP:
+      level = EVENT_ERROR;
+      break;
+    default:
+      level = EVENT_WARN;
+      break;
+  }
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  event_log_addf(EVENT_SRC_SYSTEM, level, "Started after %s%s; %s in %s",
+                 event_log_reset_reason_text(rr), note,
+                 esp_app_get_description()->version,
+                 running != NULL ? running->label : "?");
+}
+
+static const char *wifi_reason_text(uint8_t reason) {
+  switch (reason) {
+    case WIFI_REASON_AUTH_EXPIRE:
+      return "authentication expired";
+    case WIFI_REASON_AUTH_LEAVE:
+      return "access point ended the connection";
+    case WIFI_REASON_DISASSOC_DUE_TO_INACTIVITY:
+      return "dropped by the access point for inactivity";
+    case WIFI_REASON_ASSOC_TOOMANY:
+      return "access point is full";
+    case WIFI_REASON_CLASS2_FRAME_FROM_NONAUTH_STA:
+    case WIFI_REASON_CLASS3_FRAME_FROM_NONASSOC_STA:
+      return "access point forgot this device";
+    case WIFI_REASON_MISSING_ACKS:
+      return "too many lost frames";
+    case WIFI_REASON_TIMEOUT:
+      return "timed out";
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+      return "no access point with the expected security";
+    case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD:
+      return "no access point with a strong enough signal";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+      return "WPA handshake timed out (wrong password?)";
+    case WIFI_REASON_BEACON_TIMEOUT:
+      return "lost the access point's signal";
+    case WIFI_REASON_NO_AP_FOUND:
+      return "access point not found";
+    case WIFI_REASON_AUTH_FAIL:
+      return "authentication failed";
+    case WIFI_REASON_ASSOC_FAIL:
+      return "association failed";
+    case WIFI_REASON_CONNECTION_FAIL:
+      return "connection failed";
+    case WIFI_REASON_ROAMING:
+      return "roaming";
+    default:
+      return NULL;
+  }
+}
+
+#define MACFMT "%02X:%02X:%02X:%02X:%02X:%02X"
+#define MAC(b) (b)[0], (b)[1], (b)[2], (b)[3], (b)[4], (b)[5]
+
+// Runs on the event loop task (small stack): short texts only
+static void wifi_events(void *arg, esp_event_base_t base, int32_t id,
+                        void *data) {
+  static uint8_t last_bssid[6];
+  static bool have_bssid = false;
+
+  if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
+    const wifi_event_sta_connected_t *e = data;
+    if (have_bssid && memcmp(last_bssid, e->bssid, sizeof(last_bssid)) != 0) {
+      event_log_addf(EVENT_SRC_WIFI, EVENT_INFO,
+                     "Moved to access point " MACFMT " (was " MACFMT
+                     "), channel %u",
+                     MAC(e->bssid), MAC(last_bssid), e->channel);
+    } else {
+      char ssid[33];
+      size_t n = e->ssid_len < 32 ? e->ssid_len : 32;
+      memcpy(ssid, e->ssid, n);
+      ssid[n] = '\0';
+      event_log_addf(EVENT_SRC_WIFI, EVENT_INFO,
+                     "Joined %s via access point " MACFMT ", channel %u", ssid,
+                     MAC(e->bssid), e->channel);
+    }
+    memcpy(last_bssid, e->bssid, sizeof(last_bssid));
+    have_bssid = true;
+  } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+    const wifi_event_sta_disconnected_t *e = data;
+    const char *why = wifi_reason_text(e->reason);
+    if (e->reason == WIFI_REASON_ASSOC_LEAVE) {
+      // this device disconnected on purpose (a restart, say): that event is
+      // already logged, and logging here would race the restart
+    } else if (e->reason == WIFI_REASON_BEACON_TIMEOUT) {
+      // the signal level tells weak coverage from a vanished access point
+      event_log_addf(EVENT_SRC_WIFI, EVENT_WARN, "Disconnected: %s (%d dBm)",
+                     why, e->rssi);
+    } else if (why != NULL) {
+      // no signal level, so retries repeat the same text and are counted
+      event_log_addf(EVENT_SRC_WIFI, EVENT_WARN, "Disconnected: %s", why);
+    } else {
+      event_log_addf(EVENT_SRC_WIFI, EVENT_WARN, "Disconnected (reason %u)",
+                     e->reason);
+    }
+  } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+    const ip_event_got_ip_t *e = data;
+    if (e->ip_changed) {  // not on every reconnect with the same lease
+      event_log_addf(EVENT_SRC_WIFI, EVENT_INFO, "Got IP address " IPSTR,
+                     IP2STR(&e->ip_info.ip));
+    }
+  }
+}
+
+// web_rescue's hook (a weak no-op there): rescue mode's restarts and
+// decisions go into the event log. Fixed strings: this can run on the 2 KB
+// esp_timer task.
+void web_rescue_note(bool restart, bool problem, const char *text) {
+  event_level_t level = problem ? EVENT_WARN : EVENT_INFO;
+  if (restart) {
+    event_log_note_restart(level, text);
+  } else {
+    event_log_add(EVENT_SRC_SYSTEM, level, text);
+  }
+}
+
+void status_events_start(void) {
+  esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_CONNECTED, wifi_events,
+                             NULL);
+  esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
+                             wifi_events, NULL);
+  esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_events, NULL);
+}
+
 void status_sections_init(const char *name) {
   snprintf(device_name, sizeof(device_name), "%s", name ? name : "");
   ui_http_add_status_section("output", output_section);
@@ -281,5 +434,6 @@ void status_sections_init(const char *name) {
   ui_http_add_status_section("sendspin", sendspin_section);
 #endif
   ui_http_add_status_section("device", device_section);
+  ui_http_add_status_section("events", events_section);
   ESP_LOGD(TAG, "status sections registered");
 }

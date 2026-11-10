@@ -38,6 +38,7 @@ _Static_assert(sizeof(CONFIG_RESCUE_AP_PASSWORD) - 1 >= 8 &&
 
 static const char *TAG = "rescue";
 
+
 #define RESCUE_MAGIC 0x5245534Bu  // "RESK"
 #define HOLD_TO_RESCUE_MS 5000
 
@@ -59,6 +60,7 @@ void rescue_mode_request(const char *why) {
   // work before the restart minimal
   s_rescue_request = RESCUE_MAGIC;
   ESP_EARLY_LOGW(TAG, "%s: rebooting into rescue mode", why);
+  web_rescue_note(true, true, why);
   esp_restart();
 }
 
@@ -128,6 +130,7 @@ bool rescue_mode_requested(void) {
       s_crash_count = 0;
       s_rescue_request = 0;
       ESP_LOGW(TAG, "crash loop: starting rescue mode");
+      web_rescue_note(false, true, "Three crashes in a row: opening rescue mode");
       return true;
     }
   }
@@ -145,6 +148,8 @@ bool rescue_mode_requested(void) {
     vTaskDelay(pdMS_TO_TICKS(300));
     if (button_pressed()) {
       ESP_LOGW(TAG, "rescue button held at boot");
+      web_rescue_note(false, false,
+                      "Rescue button held at start-up: opening rescue mode");
       return true;
     }
   }
@@ -163,8 +168,11 @@ void rescue_mode_run(bool nvs_ok) {
   if (web_rescue_start(&cfg) != ESP_OK) {
     ESP_LOGE(TAG, "could not start the access point, rebooting in 30 s");
     vTaskDelay(pdMS_TO_TICKS(30000));
+    web_rescue_note(true, true,
+                    "Rescue mode could not open its access point; restarting");
     esp_restart();
   }
+  web_rescue_note(false, false, "Rescue mode: setup access point open");
   const int64_t start = esp_timer_get_time();
   while (1) {
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -175,6 +183,7 @@ void rescue_mode_run(bool nvs_ok) {
     if (esp_timer_get_time() - last >
         (int64_t)CONFIG_RESCUE_IDLE_REBOOT_S * 1000000LL) {
       ESP_LOGI(TAG, "idle, rebooting into normal mode");
+      web_rescue_note(true, false, "Rescue mode idle; restarting normally");
       esp_restart();
     }
 #endif
@@ -183,7 +192,9 @@ void rescue_mode_run(bool nvs_ok) {
 
 /* ---- normal operation ---------------------------------------------- */
 
-static void no_ip_cb(void *arg) { rescue_mode_request("no IP address"); }
+static void no_ip_cb(void *arg) {
+  rescue_mode_request("Rescue mode: no IP address in time");
+}
 
 static void stable_cb(void *arg) {
   // ran with a network for a while: this firmware is good
@@ -214,7 +225,7 @@ static void button_task(void *arg) {
   while (1) {
     vTaskDelay(pdMS_TO_TICKS(100));
     held_ms = button_pressed() ? held_ms + 100 : 0;
-    if (held_ms >= HOLD_TO_RESCUE_MS) rescue_mode_request("button held");
+    if (held_ms >= HOLD_TO_RESCUE_MS) rescue_mode_request("Rescue mode: button held");
   }
 }
 #endif
@@ -224,7 +235,7 @@ static void no_credentials_task(void *arg) {
   vTaskDelay(pdMS_TO_TICKS(3000));
   wifi_config_t cfg;
   if (esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK && cfg.sta.ssid[0] == 0) {
-    rescue_mode_request("no WiFi credentials stored");
+    rescue_mode_request("Rescue mode: no WiFi credentials stored");
   }
   vTaskDelete(NULL);
 }
@@ -265,10 +276,11 @@ void rescue_mode_arm(void) {
 bool rescue_mode_requested(void) { return false; }
 void rescue_mode_run(bool nvs_ok) {
   (void)nvs_ok;
+  web_rescue_note(true, true, "Rescue mode is not built in; restarting");
   esp_restart();
 }
 void rescue_mode_request(const char *why) {
-  (void)why;
+  web_rescue_note(true, true, why);
   esp_restart();
 }
 void rescue_mode_arm(void) {}

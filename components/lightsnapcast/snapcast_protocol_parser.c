@@ -1,3 +1,4 @@
+#include "event_log.h"
 #include "snapcast_protocol_parser.h"
 
 #include "esp_log.h"
@@ -171,7 +172,7 @@ parser_return_state_t parse_wire_chunk_message(snapcast_protocol_parser_t* parse
       // if we got a supported codec header message (cf. parse_codec_header_message).
       // So if we get here, something went very wrong.
       // critical error
-      esp_restart();
+      event_log_restart("Restarting: audio for an unknown codec");
     }
   }
 
@@ -239,7 +240,7 @@ parser_return_state_t parse_codec_header_message(
              "for codec payload");
 
     // critical error
-    esp_restart();
+    event_log_restart("Restarting: out of memory for the codec header");
   }
 
   if (!read_data(parser, (uint8_t *)*codecPayload, *codecPayloadLen)) return PARSER_RESTART_CONNECTION;
@@ -265,7 +266,7 @@ parser_return_state_t parse_sever_settings_message(
              "couldn't get memory for "
              "server settings string");
     // critical error
-    esp_restart();
+    event_log_restart("Restarting: out of memory for the server settings");
   }
 
   size_t tmpSize = base_message_rx->size - 4;
@@ -295,7 +296,7 @@ parser_return_state_t parse_sever_settings_message(
              "settings: %d",
              deserialization_result);
     // critical error. A failed deserialization could potentially be a memory issue.
-    esp_restart();
+    event_log_restart("Restarting: could not read the server settings");
   }
 
   return PARSER_OK;  // do callback

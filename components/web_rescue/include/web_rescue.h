@@ -87,8 +87,15 @@ bool rescue_mode_requested(void);
 // not return. Call after nvs_flash_init().
 void rescue_mode_run(bool nvs_ok) __attribute__((noreturn));
 
-// Reboot into rescue mode now (logs `why`). Does not return.
+// Reboot into rescue mode now (logs `why`, a fixed string such as "Rescue
+// mode: button held"). Does not return.
 void rescue_mode_request(const char *why) __attribute__((noreturn));
+
+// Hook for an application's event log: rescue mode reports its restarts and
+// decisions here with a short fixed text. `restart`: a restart follows right
+// away; `problem`: something went wrong. The default does nothing. It can run
+// on the 2 KB esp_timer task: an override must not printf.
+void web_rescue_note(bool restart, bool problem, const char *text);
 
 // Normal operation: watch the button (5 s hold -> rescue) and start the
 // "no IP within CONFIG_RESCUE_NO_IP_TIMEOUT_S -> rescue" timer. Call after

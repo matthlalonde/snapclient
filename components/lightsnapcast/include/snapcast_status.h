@@ -66,6 +66,8 @@ typedef struct {
   uint32_t frames_dropped;   // sample insertion: frames skipped (catch up)
   uint32_t frames_inserted;  // and frames repeated (hold back), since boot
   uint32_t queued_ms;        // audio waiting in the chunk queue
+  uint32_t player_stack_free;  // lowest free stack of the player task, bytes
+                               // (0 = not measured yet)
   uint32_t hard_resyncs;     // playback interruptions since boot
   int64_t last_hard_resync_us;
   snapcast_resync_reason_t last_resync_reason;

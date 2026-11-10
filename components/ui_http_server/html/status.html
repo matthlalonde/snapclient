@@ -105,6 +105,53 @@
       margin-top: 12px;
     }
 
+    /* Recent events */
+    .events {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      font-size: 14px;
+    }
+
+    .events li {
+      display: grid;
+      grid-template-columns: 7.5em 5.5em 1fr;
+      gap: 8px;
+      padding: 6px 8px;
+      border-left: 3px solid #dee2e6;
+      margin-bottom: 4px;
+    }
+
+    /* lvl-*: styles.css already has .info/.error boxes */
+    .events li.lvl-warn { border-left-color: #f0ad4e; background-color: #fffaf0; }
+    .events li.lvl-error { border-left-color: #dc3545; background-color: #fdf2f3; }
+
+    .events .when {
+      color: #666;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .events .src {
+      color: #666;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      padding-top: 1px;
+    }
+
+    .events .what {
+      overflow-wrap: anywhere;
+    }
+
+    .events li.run {
+      display: block;
+      border: none;
+      color: #333;
+      font-weight: bold;
+      font-size: 13px;
+      padding: 10px 0 4px 0;
+    }
+
     #offline {
       display: none;
       margin: 0 0 20px 0;
@@ -123,6 +170,14 @@
 
       dd {
         margin-bottom: 8px;
+      }
+
+      .events li {
+        grid-template-columns: auto 1fr;
+      }
+
+      .events .what {
+        grid-column: 1 / -1;
       }
     }
   </style>
@@ -154,6 +209,14 @@
     <div class="card" id="card-device" hidden>
       <h2>Device</h2>
       <dl id="rows-device"></dl>
+    </div>
+
+    <div class="card" id="card-events" hidden>
+      <h2>Recent events</h2>
+      <ul class="events" id="starts"></ul>
+      <ul class="events" id="events"></ul>
+      <div class="hint">The last 40 events, newest first. They survive
+        restarts and crashes, but not a power cut.</div>
     </div>
   </div>
 
@@ -453,9 +516,144 @@
       renderRows('snapcast', sc);
       renderRows('sendspin', ss);
       renderRows('device', st.device);
+      updateEvents(st);
 
       document.getElementById('updated').textContent =
         `Updated ${new Date().toLocaleTimeString()}`;
+    }
+
+    // ---- recent events: fetched only when /api/status reports a change ----
+
+    let eventsKey = null;
+    let eventsInFlight = false;
+    let lastResetReason = null;
+    let lastBootAt = null;
+
+    function clock(ms) {
+      const d = new Date(ms);
+      const today = new Date();
+      const time = d.toLocaleTimeString();
+      return d.toDateString() === today.toDateString()
+        ? time
+        : `${d.toLocaleDateString()} ${time}`;
+    }
+
+    function startText(run, data, started) {
+      const unexplained = run.reason === 'restart (software)' && !run.explained
+        ? ' with no reason logged' : '';
+      if (run.boot === data.boot) {
+        return `This start (${clock(started)}): after ${run.reason}${unexplained}`;
+      }
+      const ran = run.last_ms > 0 ? `; ran at least ${duration(run.last_ms / 1000)}` : '';
+      return `Earlier start: after ${run.reason}${unexplained}${ran}`;
+    }
+
+    function renderStarts(data, started) {
+      const list = document.getElementById('starts');
+      const frag = document.createDocumentFragment();
+      const runs = data.runs || [];
+      if (runs.length > 0) {
+        const head = document.createElement('li');
+        head.className = 'run';
+        head.textContent = 'Recent starts';
+        frag.appendChild(head);
+      }
+      for (const run of runs) {
+        const li = document.createElement('li');
+        const crash = /crash|brownout|watchdog|power glitch|lockup/.test(run.reason);
+        const unexplained = run.reason === 'restart (software)' && !run.explained;
+        li.className = crash ? 'lvl-error' : unexplained ? 'lvl-warn' : 'lvl-info';
+        const what = document.createElement('span');
+        what.className = 'what';
+        what.style.gridColumn = '1 / -1';
+        what.textContent = startText(run, data, started);
+        li.appendChild(what);
+        frag.appendChild(li);
+      }
+      list.replaceChildren(frag);
+    }
+
+    function renderEvents(data, fetchedAt) {
+      const list = document.getElementById('events');
+      const card = document.getElementById('card-events');
+      const entries = (data.entries || []).slice().reverse();  // newest first
+      // this run started at about fetchedAt - uptime
+      const started = fetchedAt - data.uptime_ms;
+      renderStarts(data, started);
+      const frag = document.createDocumentFragment();
+      let group = null;
+
+      if (entries.length === 0) {
+        const li = document.createElement('li');
+        li.className = 'run';
+        li.textContent = 'No events yet.';
+        frag.appendChild(li);
+      }
+      for (const e of entries) {
+        const thisRun = e.boot === data.boot;
+        const g = thisRun ? 'now' : e.boot === data.boot - 1 ? 'prev' : 'older';
+        if (g !== group) {
+          group = g;
+          const li = document.createElement('li');
+          li.className = 'run';
+          li.textContent = g === 'now'
+            ? `Since the last start (${clock(started)})`
+            : g === 'prev'
+              ? `Before that start${lastResetReason ? ` (ended by: ${lastResetReason})` : ''}`
+              : 'Earlier runs';
+          frag.appendChild(li);
+        }
+        const li = document.createElement('li');
+        li.className = `lvl-${e.level}`;
+        const when = document.createElement('span');
+        when.className = 'when';
+        // earlier runs: no clock to go by, only the time since their start
+        when.textContent = thisRun ? clock(started + e.t_ms) : `+${duration(e.t_ms / 1000)}`;
+        const src = document.createElement('span');
+        src.className = 'src';
+        src.textContent = e.src;
+        const what = document.createElement('span');
+        what.className = 'what';
+        what.textContent = e.n > 1 ? `${e.text} (${e.n} times; time of the last)` : e.text;
+        li.append(when, src, what);
+        frag.appendChild(li);
+      }
+      list.replaceChildren(frag);
+      card.hidden = false;
+    }
+
+    async function fetchEvents(key) {
+      if (eventsInFlight) return;
+      eventsInFlight = true;
+      const controller = new AbortController();
+      const abort = setTimeout(() => controller.abort(), 5000);
+      try {
+        const response = await fetch('/api/events', { cache: 'no-store', signal: controller.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        renderEvents(data, Date.now());
+        eventsKey = key;  // only once shown: a failed fetch retries next poll
+      } catch (error) {
+        console.error('Event log update failed:', error);
+      } finally {
+        clearTimeout(abort);
+        eventsInFlight = false;
+      }
+    }
+
+    function updateEvents(st) {
+      if (st.device && st.device.reset_reason) lastResetReason = st.device.reset_reason;
+      // a restart also shows as a jump in when the board started: after a
+      // power cut the log starts over and boot:changes can repeat
+      if (st.device && typeof st.device.uptime_s === 'number') {
+        const bootAt = Date.now() - st.device.uptime_s * 1000;
+        if (lastBootAt !== null && Math.abs(bootAt - lastBootAt) > 5000) eventsKey = null;
+        lastBootAt = bootAt;
+      }
+      const ev = st.events;
+      if (!ev) return;
+      const key = `${ev.boot}:${ev.changes}`;
+      if (key !== eventsKey) fetchEvents(key);
     }
 
     function setStale(stale) {

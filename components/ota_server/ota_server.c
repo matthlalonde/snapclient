@@ -19,6 +19,7 @@
 #include "esp_wifi.h"
 #include "lwip/sockets.h"
 #include "ota_server.h"
+#include "event_log.h"
 #include "player.h"
 
 extern TaskHandle_t t_http_get_task;
@@ -257,5 +258,7 @@ void ota_server_start_my(void) {
 
   ESP_LOGI(TAG, "restart system..");
   
+  event_log_note_restart(EVENT_INFO,
+                         "Installed new firmware over port 8032; restarting");
   esp_restart();
 }

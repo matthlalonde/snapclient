@@ -38,6 +38,7 @@ typedef struct {
                             // open (retried every 500 ms)
   uint8_t volume;
   bool muted;
+  uint32_t stack_free;  // lowest free stack of the Sendspin task, bytes
 } sendspin_status_t;
 
 /**

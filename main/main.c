@@ -82,6 +82,7 @@ static bool spdif_i2s_clock_cb(player_i2s_event_t event, uint32_t sample_rate,
 #include "settings_manager.h"
 #include "snapcast.h"
 #include "snapcast_protocol_parser.h"
+#include "event_log.h"
 #include "snapcast_status.h"
 #include "status_sections.h"
 #include "ui_http_server.h"
@@ -627,7 +628,7 @@ void server_settings_msg_received(
              "Did you init player?");
 
     // critical error
-    esp_restart();
+    event_log_restart("Restarting: the player did not take the stream settings");
   }
 }
 
@@ -674,7 +675,7 @@ void codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
     if (error != 0) {
       ESP_LOGI(TAG, "Failed to init opus coder");
       //critical error
-      esp_restart();
+      event_log_restart("Restarting: could not start the Opus decoder");
     }
 
     ESP_LOGI(TAG, "Initialized opus Decoder: %d", error);
@@ -692,7 +693,7 @@ void codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
     if (flacDecoder == NULL) {
       ESP_LOGE(TAG, "Failed to init flac decoder");
       //critical error
-      esp_restart();
+      event_log_restart("Restarting: could not create the FLAC decoder");
     }
 
     FLAC__StreamDecoderInitStatus init_status =
@@ -704,7 +705,7 @@ void codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
                FLAC__StreamDecoderInitStatusString[init_status]);
 
       //critical error
-      esp_restart();
+      event_log_restart("Restarting: could not start the FLAC decoder");
     }
 
     FLAC__stream_decoder_process_until_end_of_metadata(flacDecoder);
@@ -734,7 +735,7 @@ void codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
              "codec string was detected");
 
     //critical error
-    esp_restart();
+    event_log_restart("Restarting: unknown codec in the codec header");
   }
 
   snapcast_status_set_codec(
@@ -747,7 +748,7 @@ void codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
              "Did you init player?");
 
     //critical error
-    esp_restart();
+    event_log_restart("Restarting: the player did not take the stream settings");
   }
 
   // ESP_LOGI(TAG, "done codec header msg");
@@ -861,7 +862,7 @@ void handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
                  "init player?");
 
         // critical error
-        esp_restart();
+        event_log_restart("Restarting: the player did not take the stream settings");
       }
 
       break;
@@ -968,7 +969,7 @@ void handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
                  "init player?");
 
         // critical error
-        esp_restart();
+        event_log_restart("Restarting: the player did not take the stream settings");
       }
 
       break;
@@ -1000,7 +1001,7 @@ void handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
                  "init player?");
 
         // critical error
-        esp_restart();
+        event_log_restart("Restarting: the player did not take the stream settings");
       }
 
 #if CONFIG_USE_DSP_PROCESSOR
@@ -1024,7 +1025,7 @@ void handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
       // parsed before and codec should have been set to a supported value.
       ESP_LOGE(TAG, "Decoder (2) not supported. This should never happen!");
       // critical error
-      esp_restart();
+      event_log_restart("Restarting: audio for an unsupported codec");
 
       break;
     }
@@ -1168,7 +1169,7 @@ static void http_get_task(void *pvParameters) {
   if (idCounterSemaphoreHandle == NULL) {
     ESP_LOGE(TAG, "can't create id Counter Semaphore");
 
-    esp_restart();
+    event_log_restart("Restarting: out of memory at start-up");
   }
 
   while (1) {
@@ -1275,7 +1276,7 @@ static void http_get_task(void *pvParameters) {
       if (!hello_message_serialized) {
         ESP_LOGE(TAG, "Failed to serialize hello message");
         // critical error
-        esp_restart();
+        event_log_restart("Restarting: could not build the hello message");
       }
     }
 
@@ -1284,7 +1285,7 @@ static void http_get_task(void *pvParameters) {
     if (result) {
       ESP_LOGE(TAG, "Failed to serialize base message");
       // critical error
-      esp_restart();
+      event_log_restart("Restarting: could not build the base message");
     }
 
     // NETCONN_COPY: with NOCOPY lwIP keeps pointing at these buffers until the
@@ -1402,6 +1403,10 @@ void app_main(void) {
   // our image header; let esp_flash reach the whole chip
   web_rescue_unlock_physical_flash();
 #endif
+  // Status tab event log: keep what happened before this restart, record why
+  // it restarted (after the unlock: this reads the partition table)
+  event_log_init();
+  status_events_boot();
   esp_err_t ret = nvs_flash_init();
   if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
       ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -1476,6 +1481,7 @@ void app_main(void) {
 #endif
 
   network_if_init();
+  status_events_start();  // WiFi connects and drops into the event log
   status_led_init();
 #if CONFIG_RESCUE_MODE_ENABLE
   rescue_mode_arm();
@@ -1541,7 +1547,7 @@ void app_main(void) {
     // no OTA server yet: open the setup access point so a fixed firmware
     // can be uploaded
     vTaskDelay(pdMS_TO_TICKS(30000));
-    rescue_mode_request("audio board init failed");
+    rescue_mode_request("Rescue mode: audio board did not start");
 #endif
     vTaskDelay(portMAX_DELAY);
   }
