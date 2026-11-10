@@ -42,4 +42,16 @@ menu "Sendspin player"
             Music Assistant does not reconnect by itself after an unpaired
             connection is refused.
 
+    # For the component manager only (idf_component.yml): 1 when the player
+    # is on, so sendspin-cpp is fetched. The rule can't test
+    # SENDSPIN_PLAYER_ENABLE: off and hidden (no PSRAM, or the WM8804
+    # driver), it is left out of sdkconfig.json, and the manager then
+    # refuses to configure. A hidden int with a default always has a value
+    # there. Last in the menu: right after SENDSPIN_PLAYER_ENABLE it would
+    # end the indented group of that option's settings in menuconfig.
+    config SENDSPIN_PLAYER_LIBRARY
+        int
+        default 1 if SENDSPIN_PLAYER_ENABLE
+        default 0
+
 endmenu
