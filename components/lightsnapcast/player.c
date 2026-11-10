@@ -1528,7 +1528,21 @@ static void player_task(void *pvParameters) {
           if (ret < 0) {
             ESP_LOGE(TAG, "player_setup_i2s failed: %d", ret);
 
-            return;
+            // a FreeRTOS task must not return (that aborts): shut the output
+            // down like the other exits and leave through the cleanup below
+            if (chnk != NULL) {
+              free_pcm_chunk(chnk);
+              chnk = NULL;
+            }
+            audio_set_mute(true);
+            audio_dac_enable(false);
+            if (tx_chan) {
+              my_i2s_channel_disable(tx_chan);
+              i2s_del_channel(tx_chan);
+              tx_chan = NULL;
+            }
+
+            break;
           }
 
           dmaDescDuration_us =
@@ -1791,7 +1805,9 @@ static void player_task(void *pvParameters) {
         if (p_payload != NULL) {
           #if 1
           do {
-              size_t framesToBytes = (scSet.ch + (scSet.bits >> 3));
+              // bytes per frame = channels * bytes per sample (was ch + bytes,
+              // which is only right for 16-bit stereo)
+              size_t framesToBytes = (scSet.ch * (scSet.bits >> 3));
 #if USE_SAMPLE_INSERTION
               uint32_t sampleSizeInBytes =
                   framesToBytes * INSERT_SAMPLES;
@@ -1851,7 +1867,7 @@ static void player_task(void *pvParameters) {
             }
 #endif
             int64_t alreadyWrittenTime_us = 0;
-            size_t framesToBytes = (scSet.ch + (scSet.bits >> 3));
+            size_t framesToBytes = (scSet.ch * (scSet.bits >> 3));  // was ch + bytes
             while (size) {
               size_t i2sWriteLen;
               size_t tmpSize = i2sDmaBufMaxLen * framesToBytes;

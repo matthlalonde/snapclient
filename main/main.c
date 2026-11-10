@@ -192,8 +192,10 @@ void time_sync_msg_cb(void *args) {
     return;
   }
 
+  // NETCONN_COPY: p_pkt is on the stack, and with NOCOPY lwIP would still
+  // reference it for retransmits after this function returns
   rc1 = netconn_write(lwipNetconn, p_pkt, BASE_MESSAGE_SIZE + TIME_MESSAGE_SIZE,
-                      NETCONN_NOCOPY);
+                      NETCONN_COPY);
   
   if (rc1 != ERR_OK) {
     ESP_LOGW(TAG, "error writing timesync msg");
@@ -1241,10 +1243,16 @@ static void http_get_task(void *pvParameters) {
       esp_restart();
     }
 
+    // NETCONN_COPY: with NOCOPY lwIP keeps pointing at these buffers until the
+    // server ACKs them, so a retransmit could read the hello after it is freed
     rc1 = netconn_write(lwipNetconn, base_message_serialized, BASE_MESSAGE_SIZE,
-                        NETCONN_NOCOPY);
+                        NETCONN_COPY);
     rc1 |= netconn_write(lwipNetconn, hello_message_serialized,
-                        base_message_rx.size, NETCONN_NOCOPY);
+                        base_message_rx.size, NETCONN_COPY);
+    // free on failure too: a kept buffer skipped re-serializing on the retry,
+    // which then sent the hello with base_message_rx.size still 0
+    free(hello_message_serialized);
+    hello_message_serialized = NULL;
     if (rc1 != ERR_OK) {
       ESP_LOGE(TAG, "netconn failed to send hello message");
 
@@ -1252,9 +1260,6 @@ static void http_get_task(void *pvParameters) {
     }
 
     ESP_LOGI(TAG, "netconn sent hello message");
-
-    free(hello_message_serialized);
-    hello_message_serialized = NULL;
 
     // init default setting
     scSet.buf_ms = 500;
