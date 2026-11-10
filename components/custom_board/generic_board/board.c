@@ -28,6 +28,9 @@
 
 #include "audio_mem.h"
 #include "esp_log.h"
+#if CONFIG_SPDIF_WM8804
+#include "wm8804.h"
+#endif
 // #include "periph_adc_button.h"
 // #include "periph_sdcard.h"
 
@@ -83,6 +86,14 @@ audio_hal_handle_t audio_board_codec_init(void) {
   ESP_LOGI("HAL", "codec_hal done");
 
   AUDIO_NULL_CHECK(TAG, codec_hal, return NULL);
+
+#if CONFIG_SPDIF_WM8804
+  // optical / coaxial output next to the DAC. Without it the player keeps
+  // the ESP32 as I2S master, so the DAC (AUX) still plays.
+  if (wm8804_init() != ESP_OK) {
+    ESP_LOGW(TAG, "WM8804 S/PDIF output not available, check its I2C pins");
+  }
+#endif
   return codec_hal;
 }
 

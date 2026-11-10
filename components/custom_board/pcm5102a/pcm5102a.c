@@ -42,6 +42,17 @@ esp_err_t pcm5102a_init(audio_hal_codec_config_t *codec_cfg) {
 
   gpio_config_t io_conf;
 
+#if CONFIG_PCM5102A_GND_PIN >= 0
+  // same as the board's original firmware: this pin is the DAC's ground or
+  // a strap, so it must sit low whenever audio runs
+  gpio_reset_pin(CONFIG_PCM5102A_GND_PIN);
+  gpio_set_direction(CONFIG_PCM5102A_GND_PIN, GPIO_MODE_OUTPUT);
+  gpio_set_level(CONFIG_PCM5102A_GND_PIN, 0);
+  // keep it driven in light sleep too (IDF floats every GPIO there by default)
+  gpio_sleep_sel_dis(CONFIG_PCM5102A_GND_PIN);
+  ESP_LOGI(TAG, "GPIO%d held low (DAC ground)", CONFIG_PCM5102A_GND_PIN);
+#endif
+
   if (CONFIG_PCM5102A_MUTE_PIN < 0) {
     return ESP_OK;
   }

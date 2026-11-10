@@ -1,1 +1,91 @@
 # this was moved to audio_board
+
+menu "S/PDIF output (WM8804)"
+    depends on AUDIO_BOARD_CUSTOM
+
+    config SPDIF_WM8804
+        bool "WM8804 S/PDIF transmitter on the DAC's I2S bus"
+        default n
+        help
+            Drive a Cirrus/Wolfson WM8804(G) that listens on the same I2S
+            lines as the DAC and sends the audio out of an optical (TOSLINK)
+            or coaxial S/PDIF port, in addition to the selected DAC. It is
+            configured over I2C; see "I2S clock master" for the two ways a
+            board can wire its clocks. If the WM8804 does not answer, the
+            ESP32 runs as I2S master and the DAC keeps working.
+
+    choice WM8804_CLOCKING
+        prompt "I2S clock master"
+        depends on SPDIF_WM8804
+        default WM8804_CLK_ESP32_MASTER
+        help
+            Which chip generates MCLK/BCLK/LRCLK on the I2S bus.
+
+        config WM8804_CLK_ESP32_MASTER
+            bool "ESP32 (MCLK pin wired to WM8804 MCLK)"
+            help
+                The ESP32 is I2S master and outputs MCLK on "Master i2s mclk",
+                which must be the GPIO wired to WM8804 pin 16: the WM8804 is
+                an audio-interface slave whose transmitter runs from that
+                MCLK. Up to 96 kHz (the WM8804 MCLK input limit).
+
+        config WM8804_CLK_WM8804_MASTER
+            bool "WM8804 (own crystal + PLL, ESP32 is I2S slave)"
+            depends on !DAC_ADAU1961
+            help
+                No ESP32 GPIO reaches WM8804 MCLK (pin 16). The WM8804 makes
+                MCLK, BCLK (64 fs) and LRCLK from its crystal and drives them
+                to the ESP32 (I2S slave) and the DAC; nothing else may drive
+                those nets, and "Master i2s mclk" is ignored. The PLL is
+                trimmed continuously so the sample clock stays locked to the
+                ESP32 clock (counting LRCLK on "Master i2s lrck"), which keeps
+                multi-room sync intact. 32-96 kHz; other rates fall back to
+                the ESP32 as master with the optical output off.
+    endchoice
+
+    config WM8804_XTAL_HZ
+        int "WM8804 crystal frequency (Hz)"
+        depends on WM8804_CLK_WM8804_MASTER
+        range 10000000 27000000
+        default 27000000
+        help
+            Frequency of the crystal on WM8804 pins 10/11 (printed on it),
+            typically 27000000, 24000000 or 12000000. The WM8804 accepts
+            10-14.4 MHz or 16.28-27 MHz.
+
+    config WM8804_I2C_SDA
+        int "WM8804 I2C SDA GPIO"
+        depends on SPDIF_WM8804
+        default -1
+
+    config WM8804_I2C_SCL
+        int "WM8804 I2C SCL GPIO"
+        depends on SPDIF_WM8804
+        default -1
+
+    config WM8804_I2C_ADDR
+        hex "WM8804 I2C address (7-bit)"
+        depends on SPDIF_WM8804
+        range 0x3A 0x3B
+        default 0x3B
+        help
+            0x3A when the CSB/GPO1 pin is low at reset, 0x3B when it is high.
+
+    config WM8804_I2C_PORT
+        int "I2C controller used for the WM8804"
+        depends on SPDIF_WM8804
+        range 0 1
+        default 1
+        help
+            DAC drivers that use I2C take controller 0, so the WM8804 uses
+            controller 1 by default.
+
+    config WM8804_RESET_PIN
+        int "WM8804 RESETB GPIO (-1 if not wired)"
+        depends on SPDIF_WM8804
+        default -1
+        help
+            Active-low reset input of the WM8804. Leave at -1 if it is tied
+            to an RC network or pull-up on the board.
+
+endmenu

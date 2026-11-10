@@ -262,6 +262,16 @@ menu "Audio Board"
 	            help
 	                GPIO number to control mute/unmute.
 	                This is labeled "X(S)MT" on chip/boards
+
+	        config PCM5102A_GND_PIN
+	            int "GPIO held low as the DAC's ground (-1: none)"
+	            default -1
+	            help
+	                Some boards take a DAC ground (or a strap such as FMT)
+	                from a GPIO that firmware drives low, e.g. a PCM5102A
+	                module plugged straight into a dev-kit header.
+	                airplay-esp32 calls this I2S_GND_IO. The pin is driven
+	                low when the DAC is initialised and never released.
 	    endmenu
 
 	     menu "TI PCM51XX interface Configuration"

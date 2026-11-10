@@ -68,6 +68,27 @@ typedef struct snapcastSetting_s {
   uint32_t pcmBufSize;
 } snapcastSetting_t;
 
+/**
+ * Optional hook for a chip on the I2S bus that follows or provides its
+ * clocks (e.g. a WM8804 S/PDIF transmitter). Called from the player task:
+ *   PLAYER_I2S_PREPARE  before the TX channel is (re)built for a format;
+ *                       return true if that chip will be the I2S clock
+ *                       master (the ESP32 then runs as I2S slave: 64 fs,
+ *                       no MCLK), false for the ESP32 as master
+ *   PLAYER_I2S_DOWN     right before the TX channel (and MCLK) is deleted
+ *   PLAYER_I2S_UP       right after the channel was set up, before it is
+ *                       enabled; a clock master must start its clocks here
+ * The return value is used only for PREPARE.
+ */
+typedef enum {
+  PLAYER_I2S_PREPARE,
+  PLAYER_I2S_DOWN,
+  PLAYER_I2S_UP,
+} player_i2s_event_t;
+typedef bool (*player_i2s_clock_cb_t)(player_i2s_event_t event,
+                                      uint32_t sample_rate, uint8_t bits);
+void player_set_i2s_clock_cb(player_i2s_clock_cb_t cb);
+
 int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_);
 int deinit_player(void);
 int start_player(snapcastSetting_t *setting);

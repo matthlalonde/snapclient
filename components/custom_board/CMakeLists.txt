@@ -1,6 +1,6 @@
 # Edit following two lines to set component requirements (see docs)
 set(COMPONENT_REQUIRES audio_hal audio_board)
-set(COMPONENT_PRIV_REQUIRES esp_peripherals)
+set(COMPONENT_PRIV_REQUIRES esp_peripherals driver esp_timer esp_driver_pcnt esp_driver_gpio)
 
 if(CONFIG_AUDIO_BOARD_CUSTOM)
   message(STATUS "Current board name is " CONFIG_AUDIO_BOARD_CUSTOM)
@@ -50,6 +50,12 @@ if(CONFIG_AUDIO_BOARD_CUSTOM)
 	message(STATUS "Selected DAC is " CONFIG_DAC_TAS5805M)
 	list(APPEND COMPONENT_ADD_INCLUDEDIRS ./tas5805m/include)
 	list(APPEND COMPONENT_SRCS ./tas5805m/tas5805m.c)
+  endif()
+
+  if(CONFIG_SPDIF_WM8804)
+	message(STATUS "S/PDIF transmitter WM8804 enabled")
+	list(APPEND COMPONENT_ADD_INCLUDEDIRS ./wm8804/include)
+	list(APPEND COMPONENT_SRCS ./wm8804/wm8804.c)
   endif()
 
   if(CONFIG_DAC_PT8211)

@@ -35,6 +35,7 @@
 #include "driver/gptimer.h"
 #include "driver/i2s_std.h"
 #include "player.h"
+#include "driver/gpio.h"
 #include "snapcast.h"
 
 #define USE_SAMPLE_INSERTION CONFIG_USE_SAMPLE_INSERTION
@@ -124,6 +125,10 @@ extern void audio_set_mute(bool mute);
 extern void audio_dac_enable(bool enabled);
 
 static i2s_chan_handle_t tx_chan = NULL;  // I2S tx channel handler
+static player_i2s_clock_cb_t i2s_clock_cb = NULL;
+static bool i2s_slave = false;  // ESP32 is I2S slave for the current format
+
+void player_set_i2s_clock_cb(player_i2s_clock_cb_t cb) { i2s_clock_cb = cb; }
 static bool i2sEnabled = false;
 
 i2s_std_gpio_config_t pin_config0;
@@ -224,6 +229,11 @@ static esp_err_t player_setup_i2s(snapcastSetting_t *setting) {
     bits = I2S_DATA_BIT_WIDTH_16BIT;
   }
 
+  // ask a clock-providing bus chip (WM8804) whether it masters this format;
+  // if not it has already stopped driving the bus
+  i2s_slave = i2s_clock_cb &&
+              i2s_clock_cb(PLAYER_I2S_PREPARE, (uint32_t)sr, (uint8_t)bits);
+
   // ensure save setting
   uint32_t chkInFrames = setting->chkInFrames;
   if (chkInFrames == 0) {
@@ -294,6 +304,7 @@ static esp_err_t player_setup_i2s(snapcastSetting_t *setting) {
 #endif
 
   if (tx_chan) {
+    if (i2s_clock_cb) i2s_clock_cb(PLAYER_I2S_DOWN, 0, 0);
     my_i2s_channel_disable(tx_chan);
     i2s_del_channel(tx_chan);
     tx_chan = NULL;
@@ -301,7 +312,8 @@ static esp_err_t player_setup_i2s(snapcastSetting_t *setting) {
 
   i2s_chan_config_t tx_chan_cfg = {
       .id = i2sNum,
-      .role = I2S_ROLE_MASTER,
+      // slave: BCLK/LRCLK come from an external master (see PREPARE above)
+      .role = i2s_slave ? I2S_ROLE_SLAVE : I2S_ROLE_MASTER,
       .dma_desc_num = i2sDmaBufCnt,
       .dma_frame_num = i2sDmaBufMaxLen,
       .auto_clear = true,
@@ -339,7 +351,24 @@ static esp_err_t player_setup_i2s(snapcastSetting_t *setting) {
       .gpio_cfg = pin_config0,
   };
 
+  if (i2s_slave) {
+    // the external clock master runs BCLK at 64 fs; we do not drive MCLK
+    tx_std_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
+    // faster internal clock (12 x BCLK, <= 74 MHz at 96 kHz) so TX data
+    // meets the DIN setup time; IDF's minimum of 8 is marginal at 96 kHz
+    tx_std_cfg.clk_cfg.bclk_div = 12;
+    tx_std_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED;
+    // a previous master-mode channel leaves BCLK/WS/MCLK pads as outputs
+    // (i2s_del_channel does not release them): stop driving before the
+    // external master starts
+    if (pin_config0.bclk >= 0) gpio_set_direction(pin_config0.bclk, GPIO_MODE_INPUT);
+    if (pin_config0.ws >= 0) gpio_set_direction(pin_config0.ws, GPIO_MODE_INPUT);
+    if (pin_config0.mclk >= 0) gpio_set_direction(pin_config0.mclk, GPIO_MODE_INPUT);
+  }
+
   ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_chan, &tx_std_cfg));
+  // MCLK runs from here on; let bus followers (S/PDIF) lock to it
+  if (i2s_clock_cb) i2s_clock_cb(PLAYER_I2S_UP, (uint32_t)sr, (uint8_t)bits);
   // This prevents pops/clicks on some I2S codecs
   ensure_noiseless(tx_chan);
 
@@ -407,6 +436,7 @@ int deinit_player(void) {
   }
   
   if (tx_chan) {
+    if (i2s_clock_cb) i2s_clock_cb(PLAYER_I2S_DOWN, 0, 0);
     i2s_del_channel(tx_chan);
     tx_chan = NULL;
   }
@@ -1536,6 +1566,7 @@ static void player_task(void *pvParameters) {
             }
             audio_set_mute(true);
             audio_dac_enable(false);
+            if (i2s_clock_cb) i2s_clock_cb(PLAYER_I2S_DOWN, 0, 0);
             if (tx_chan) {
               my_i2s_channel_disable(tx_chan);
               i2s_del_channel(tx_chan);
@@ -2131,6 +2162,7 @@ static void player_task(void *pvParameters) {
 
       audio_set_mute(true);
       audio_dac_enable(false);
+      if (i2s_clock_cb) i2s_clock_cb(PLAYER_I2S_DOWN, 0, 0);
       my_i2s_channel_disable(tx_chan);
       i2s_del_channel(tx_chan);
       tx_chan = NULL;

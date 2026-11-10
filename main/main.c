@@ -53,6 +53,27 @@
 // flac decoder is implemented as a subcomponet from master git repo
 #include "FLAC/stream_decoder.h"
 #include "connection_handler.h"
+#if CONFIG_SPDIF_WM8804
+#include "player.h"
+#include "wm8804.h"
+
+// The WM8804 follows the I2S clocks (ESP32 master, it runs from MCLK) or
+// provides them (WM8804 master, ESP32 slave); the player asks it per format.
+static bool spdif_i2s_clock_cb(player_i2s_event_t event, uint32_t sample_rate,
+                               uint8_t bits) {
+  switch (event) {
+    case PLAYER_I2S_PREPARE:
+      return wm8804_prepare(sample_rate, bits);
+    case PLAYER_I2S_DOWN:
+      wm8804_stop();
+      break;
+    case PLAYER_I2S_UP:
+      wm8804_set_format(sample_rate, bits);
+      break;
+  }
+  return false;
+}
+#endif
 #include "ota_server.h"
 #include "player.h"
 #include "settings_manager.h"
@@ -1510,6 +1531,11 @@ void app_main(void) {
 
   init_snapcast(audioQHdl);
   init_player(i2s_pin_config0, I2S_NUM_0);
+#if CONFIG_SPDIF_WM8804
+  if (wm8804_present()) {
+    player_set_i2s_clock_cb(spdif_i2s_clock_cb);
+  }
+#endif
 
   #if CONFIG_DAC_TAS5805M
   // Apply persisted TAS5805M settings now that the codec has been initialized
