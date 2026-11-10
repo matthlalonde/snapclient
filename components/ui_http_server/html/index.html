@@ -45,6 +45,8 @@
       margin: 0;
       padding: 0;
       flex: 1;
+      min-width: 0;
+      overflow-x: auto;  /* phones: the tabs scroll instead of being cut off */
     }
 
     .nav-tabs li {
@@ -69,6 +71,19 @@
       color: white;
     }
 
+    /* phones; after the base rules so it wins */
+    @media (max-width: 600px) {
+      .nav-bar h1 {
+        font-size: 16px;
+        padding: 15px 12px;
+      }
+
+      .nav-tabs a {
+        padding: 15px 14px;
+        white-space: nowrap;
+      }
+    }
+
     /* Content Area */
     .content-container {
       flex: 1;
@@ -88,7 +103,8 @@
   <nav class="nav-bar">
     <h1>ESP32 Snapclient</h1>
     <ul class="nav-tabs" id="nav-tabs">
-      <li><a href="#" class="nav-link active" data-page="general-settings.html">General Settings</a></li>
+      <li><a href="#" class="nav-link active" data-page="status.html">Status</a></li>
+      <li><a href="#" class="nav-link" data-page="general-settings.html">General Settings</a></li>
       <li id="dsp-tab" style="display: none;"><a href="#" class="nav-link" data-page="dsp-settings.html">DSP Settings</a></li>
       <li id="dac-tab" style="display: none;"><a href="#" class="nav-link" data-page="dac-settings.html">DAC Settings</a></li>
       <li id="eq-tab" style="display: none;"><a href="#" class="nav-link" data-page="eq-settings.html">EQ</a></li>
@@ -96,7 +112,7 @@
   </nav>
 
   <div class="content-container">
-    <iframe id="content-frame" class="content-frame" src="general-settings.html"></iframe>
+    <iframe id="content-frame" class="content-frame" src="status.html"></iframe>
   </div>
 
   <script>
@@ -173,7 +189,7 @@
       const urlParams = new URLSearchParams(window.location.search);
       const backend = urlParams.get('backend');
       if (backend) {
-        const initialPage = 'general-settings.html';
+        const initialPage = 'status.html';
         contentFrame.src = `${initialPage}?backend=${encodeURIComponent(backend)}`;
       }
 

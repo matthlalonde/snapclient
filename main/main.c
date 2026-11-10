@@ -82,6 +82,8 @@ static bool spdif_i2s_clock_cb(player_i2s_event_t event, uint32_t sample_rate,
 #include "settings_manager.h"
 #include "snapcast.h"
 #include "snapcast_protocol_parser.h"
+#include "snapcast_status.h"
+#include "status_sections.h"
 #include "ui_http_server.h"
 #if CONFIG_DAC_TAS5805M
 #include "tas5805m_settings.h"
@@ -614,6 +616,11 @@ void server_settings_msg_received(
   scSet->muted = server_settings_message->muted;
   scSet->volume = server_settings_message->volume;
 
+  snapcast_status_set_server_settings(
+      (uint8_t)server_settings_message->volume, server_settings_message->muted,
+      (uint32_t)server_settings_message->buffer_ms,
+      (int32_t)server_settings_message->latency);
+
   if (player_send_snapcast_setting(scSet) != pdPASS) {
     ESP_LOGE(TAG,
              "Failed to notify sync task. "
@@ -729,6 +736,10 @@ void codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
     //critical error
     esp_restart();
   }
+
+  snapcast_status_set_codec(
+      codec == OPUS ? "opus" : codec == FLAC ? "flac" : "pcm",
+      (uint32_t)scSet->sr, (uint8_t)scSet->bits, scSet->ch);
 
   if (player_send_snapcast_setting(scSet) != pdPASS) {
     ESP_LOGE(TAG,
@@ -1164,6 +1175,7 @@ static void http_get_task(void *pvParameters) {
     // do some house keeping
     {
       status_led_set_server_connected(false);
+      snapcast_status_set_connected(false);
 
 //      esp_timer_stop(time_sync_data.timeSyncMessageTimer);
 
@@ -1221,6 +1233,7 @@ static void http_get_task(void *pvParameters) {
     sprintf(mac_address, "%02X:%02X:%02X:%02X:%02X:%02X", base_mac[0],
             base_mac[1], base_mac[2], base_mac[3], base_mac[4], base_mac[5]);
     ESP_LOGI(TAG, "sta mac: %s", mac_address);
+    snapcast_status_set_client_id(mac_address);
 
     time_sync_data.now = esp_timer_get_time();
 
@@ -1292,6 +1305,7 @@ static void http_get_task(void *pvParameters) {
 
     ESP_LOGI(TAG, "netconn sent hello message");
     status_led_set_server_connected(true);
+    snapcast_status_set_connected(true);
 
     // init default setting
     scSet.buf_ms = 500;
@@ -1608,6 +1622,8 @@ void app_main(void) {
   #endif
 
   init_http_server_task();
+  // live state for the settings page's Status tab
+  status_sections_init(mdns_hostname);
 
   // Enable websocket server
   //  ESP_LOGI(TAG, "Setup ws server");

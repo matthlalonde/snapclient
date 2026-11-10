@@ -37,6 +37,7 @@
 #include "player.h"
 #include "driver/gpio.h"
 #include "snapcast.h"
+#include "snapcast_status.h"
 
 #define USE_SAMPLE_INSERTION CONFIG_USE_SAMPLE_INSERTION
 
@@ -1549,6 +1550,20 @@ static BaseType_t player_receive_chunk(pcm_chunk_message_t **chnk) {
 
 static bool audioCodecCanSleep = false;
 
+// Status tab: telling a network gap from the source pausing. The queue ran
+// dry while playing at ranDryAt_us; if the audio that follows is already late
+// (HARD 1 drops it), the backlog was held up on the way: a network gap. Fresh
+// audio after a pause or skip is not late. Not caught: a stall long enough
+// for this task to stop (buffer + 2 s), since a restarted player drops the
+// late backlog before it gets here; nor one that ends in a reconnect.
+#define RAN_DRY_WINDOW_US (60LL * 1000000LL)
+#define SETTINGS_GRACE_US (5LL * 1000000LL)
+static int64_t ranDryAt_us = 0;
+static bool lateAfterDry = false;
+// latency or buffer changed on the server: the resync that follows is on
+// purpose, not an interruption
+static int64_t settingsChangedAt_us = INT64_MIN / 2;
+
 /**
  *
  */
@@ -1578,13 +1593,14 @@ static void player_task(void *pvParameters) {
   size_t alreadyWritten = 0;
   static uint32_t queueCreatedWithChkInFrames = UINT32_MAX;
   int64_t playback_start_time_us = 0;
-  uint64_t samples_written = 0;  
+  uint64_t samples_written = 0;
   UBaseType_t uxHighWaterMark;
 
   memset(&scSet, 0, sizeof(snapcastSetting_t));
   player_get_snapcast_settings(&scSet);
 
   ESP_LOGI(TAG, "started sync task");
+  snapcast_status_set_player(SNAPCAST_PLAYER_SYNCING, 0, 0);
 
   //  stats_init();
 
@@ -1653,6 +1669,7 @@ static void player_task(void *pvParameters) {
       }
 
       ESP_LOGI(TAG, "output handed to another source, stopping player");
+      ranDryAt_us = 0;
 
       my_gptimer_stop(gptimer);
       audio_set_mute(true);
@@ -1681,6 +1698,12 @@ static void player_task(void *pvParameters) {
 
       if ((__scSet.buf_ms > 0) && (__scSet.chkInFrames > 0) &&
           (__scSet.sr > 0)) {
+        if ((scSet.buf_ms != __scSet.buf_ms) ||
+            (scSet.cDacLat_ms != __scSet.cDacLat_ms)) {
+          settingsChangedAt_us = esp_timer_get_time();
+          ranDryAt_us = 0;
+        }
+
         buf_us = (int64_t)(__scSet.buf_ms) * 1000LL;
 
         clientDacLatency_us = (int64_t)__scSet.cDacLat_ms * 1000LL;
@@ -1723,6 +1746,7 @@ static void player_task(void *pvParameters) {
 #endif
 
           initialSync = 0;
+          snapcast_status_set_player(SNAPCAST_PLAYER_SYNCING, 0, 0);
         }
 
         if ((scSet.buf_ms != __scSet.buf_ms) ||
@@ -1911,6 +1935,14 @@ static void player_task(void *pvParameters) {
           age = (int64_t)timer_val - (-age);
 
           initialSync = 1;
+          snapcast_status_set_player(SNAPCAST_PLAYER_PLAYING, (uint32_t)scSet.sr,
+                                     (uint8_t)scSet.bits);
+          if (ranDryAt_us != 0 && lateAfterDry &&
+              esp_timer_get_time() - ranDryAt_us < RAN_DRY_WINDOW_US) {
+            snapcast_status_hard_resync(SNAPCAST_RESYNC_QUEUE_EMPTY);
+          }
+          ranDryAt_us = 0;
+          lateAfterDry = false;
 
           // TODO: use a timer to un-mute non blocking
           vTaskDelay(pdMS_TO_TICKS(2));
@@ -1940,7 +1972,11 @@ static void player_task(void *pvParameters) {
                    "largest block %d, rssi: %d, left in queue %d",
                    age, diff2Server, heap_caps_get_free_size(MALLOC_CAP_32BIT),
                    heap_caps_get_largest_free_block(MALLOC_CAP_32BIT), ap.rssi, msgWaiting);
-                   
+
+          if (ranDryAt_us != 0) {
+            lateAfterDry = true;  // the audio after the gap came in late
+          }
+
           // get count of chunks we are late for
           uint32_t c = ceil((float)age / (float)chunkDuration_us);  // round up
 
@@ -1993,8 +2029,9 @@ static void player_task(void *pvParameters) {
               if ((dir_insert_sample > 0) && (size >= sampleSizeInBytes)) {
                 size -= sampleSizeInBytes;
                 dir_insert_sample = 0;
+                snapcast_status_frames_corrected(INSERT_SAMPLES);
               }
-#endif             
+#endif
               i2s_channel_write(tx_chan, p_payload, size, &written, portMAX_DELAY);
               
               samples_written += (written / framesToBytes);
@@ -2011,7 +2048,9 @@ static void player_task(void *pvParameters) {
                   samples_written += (written / framesToBytes);
                   dir_insert_sample = 0;
                   chunkStart += (1000000ll * (written / framesToBytes) / scSet.sr);
-                } 
+                  snapcast_status_frames_corrected(
+                      -(int32_t)(written / framesToBytes));
+                }
               }
 #endif
               if (size == 0) {
@@ -2225,6 +2264,17 @@ static void player_task(void *pvParameters) {
 
             insertedSamplesCounter = 0;
 
+            int64_t now_us = esp_timer_get_time();
+            if (now_us - settingsChangedAt_us < SETTINGS_GRACE_US) {
+              // the server moved the latency or buffer: expected
+            } else if (msgWaiting == 0) {
+              ranDryAt_us = now_us;  // decided when playback resumes
+              lateAfterDry = false;
+            } else {
+              snapcast_status_hard_resync(SNAPCAST_RESYNC_DRIFT);
+            }
+            snapcast_status_set_player(SNAPCAST_PLAYER_SYNCING, 0, 0);
+
             continue;
           }
 
@@ -2259,6 +2309,15 @@ static void player_task(void *pvParameters) {
             adjust_apll(dir);
           }
 #endif
+          {
+            bool syncValid = MEDIANFILTER_isFull(&shortMedianFilter, 0);
+            int64_t err = shortMedian;
+            if (err > INT32_MAX) err = INT32_MAX;
+            if (err < INT32_MIN) err = INT32_MIN;
+            int64_t queued_us = (int64_t)msgWaiting * chunkDuration_us;
+            snapcast_status_set_sync(syncValid, (int32_t)err, (int8_t)dir,
+                                     (uint32_t)(queued_us / 1000));
+          }
            ESP_LOGD(TAG, "%d, %lldus, %lldus, %lldus, q:%d, %lld, %lld", dir,
                    age, shortMedian, miniMedian,
                    uxQueueMessagesWaiting(pcmChkQHdl), insertedSamplesCounter,
@@ -2335,6 +2394,7 @@ static void player_task(void *pvParameters) {
   xSemaphoreGive(outputMux);
 
   tg0_timer_deinit();
+  snapcast_status_set_player(SNAPCAST_PLAYER_STOPPED, 0, 0);
   playerstarted = false;
   ESP_LOGI(TAG, "stop player done");
   playerTaskHandle = NULL;

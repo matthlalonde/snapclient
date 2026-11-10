@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Status</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="index.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 800px;
+      margin: 20px auto;
+      padding: 20px;
+      background-color: #f5f5f5;
+      color: #333;
+    }
+
+    .cards {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .card {
+      background-color: white;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+
+    .card h2 {
+      font-size: 16px;
+      margin: 0 0 12px 0;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .card.stale {
+      opacity: 0.55;
+    }
+
+    /* "Now" card: which source owns the output */
+    .now {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
+    .now-source {
+      font-size: 22px;
+      font-weight: bold;
+    }
+
+    .now-detail {
+      color: #666;
+      font-size: 14px;
+      margin-top: 4px;
+    }
+
+    .updated {
+      color: #888;
+      font-size: 12px;
+      text-align: right;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 12px;
+      font-weight: bold;
+      background-color: #e9ecef;
+      color: #495057;
+    }
+
+    .badge.ok { background-color: #d4edda; color: #155724; }
+    .badge.warn { background-color: #fff3cd; color: #856404; }
+    .badge.off { background-color: #e9ecef; color: #6c757d; }
+
+    dl {
+      display: grid;
+      grid-template-columns: minmax(130px, 34%) 1fr;
+      gap: 6px 16px;
+      margin: 0;
+      font-size: 14px;
+    }
+
+    dt {
+      color: #666;
+    }
+
+    dd {
+      margin: 0;
+      overflow-wrap: anywhere;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .hint {
+      color: #888;
+      font-size: 12px;
+      margin-top: 12px;
+    }
+
+    #offline {
+      display: none;
+      margin: 0 0 20px 0;
+    }
+
+    @media (max-width: 480px) {
+      body {
+        margin: 0;
+        padding: 16px;
+      }
+
+      dl {
+        grid-template-columns: 1fr;
+        gap: 2px;
+      }
+
+      dd {
+        margin-bottom: 8px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="offline" class="warning" role="status">Can't reach the device. Retrying&hellip;</div>
+
+  <div class="cards">
+    <div class="card" id="card-now">
+      <div class="now">
+        <div>
+          <div class="now-source" id="now-source">Loading&hellip;</div>
+          <div class="now-detail" id="now-detail"></div>
+        </div>
+        <div class="updated" id="updated"></div>
+      </div>
+    </div>
+
+    <div class="card" id="card-snapcast" hidden>
+      <h2>Snapcast <span class="badge" id="badge-snapcast"></span></h2>
+      <dl id="rows-snapcast"></dl>
+    </div>
+
+    <div class="card" id="card-sendspin" hidden>
+      <h2>Sendspin <span class="badge" id="badge-sendspin"></span></h2>
+      <dl id="rows-sendspin"></dl>
+    </div>
+
+    <div class="card" id="card-device" hidden>
+      <h2>Device</h2>
+      <dl id="rows-device"></dl>
+    </div>
+  </div>
+
+  <div class="hint">Updates every 2 seconds while this tab is open.</div>
+
+  <script>
+    'use strict';
+
+    const POLL_MS = 2000;
+
+    // ---- formatting ----
+
+    function has(v) {
+      return v !== undefined && v !== null && v !== '';
+    }
+
+    function duration(s) {
+      if (!has(s)) return null;
+      s = Math.max(0, Math.floor(s));
+      const d = Math.floor(s / 86400);
+      const h = Math.floor((s % 86400) / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const sec = s % 60;
+      if (d > 0) return `${d} d ${h} h`;
+      if (h > 0) return `${h} h ${String(m).padStart(2, '0')} min`;
+      if (m > 0) return `${m} min ${String(sec).padStart(2, '0')} s`;
+      return `${sec} s`;
+    }
+
+    function rate(hz) {
+      if (!has(hz)) return null;
+      return `${(hz / 1000).toLocaleString('en', { maximumFractionDigits: 1 })} kHz`;
+    }
+
+    function format(o) {
+      // "44.1 kHz · 16-bit · stereo"
+      if (!has(o.sample_rate)) return null;
+      const parts = [rate(o.sample_rate)];
+      if (has(o.bits)) parts.push(`${o.bits}-bit`);
+      if (has(o.channels)) parts.push(o.channels === 2 ? 'stereo' : o.channels === 1 ? 'mono' : `${o.channels} ch`);
+      return parts.join(' · ');
+    }
+
+    function codecFormat(o) {
+      const f = format(o);
+      if (!has(o.codec)) return f;
+      const codec = o.codec.toUpperCase();
+      return f ? `${codec}, ${f}` : codec;
+    }
+
+    function micros(us) {
+      if (!has(us)) return null;
+      const sign = us > 0 ? '+' : us < 0 ? '−' : '';
+      const a = Math.abs(us);
+      if (a >= 1000) return `${sign}${(a / 1000).toFixed(a >= 10000 ? 0 : 1)} ms`;
+      return `${sign}${Math.round(a)} µs`;
+    }
+
+    function kib(bytes) {
+      if (!has(bytes)) return null;
+      return `${Math.round(bytes / 1024).toLocaleString('en')} KB`;
+    }
+
+    function volume(o) {
+      if (!has(o.volume)) return null;
+      return o.muted ? `${o.volume} % (muted)` : `${o.volume} %`;
+    }
+
+    function ago(s) {
+      const d = duration(s);
+      return d ? `${d} ago` : null;
+    }
+
+    function signal(rssi) {
+      if (!has(rssi)) return null;
+      const q = rssi >= -60 ? 'good' : rssi >= -70 ? 'fair' : 'weak';
+      return `${rssi} dBm (${q})`;
+    }
+
+    // ---- what each card shows: [label, value function]; null hides a row ----
+
+    const SNAPCAST_PLAYER = {
+      stopped: 'Stopped',
+      syncing: 'Syncing to the server clock',
+      playing: 'Playing',
+      handed_over: 'Paused while Sendspin plays',
+    };
+
+    const DISCOVERY = {
+      mdns: 'mDNS',
+      static: 'host and port setting',
+    };
+
+    const CORRECTION = {
+      none: 'clock at nominal speed',
+      faster: 'clock running faster',
+      slower: 'clock running slower',
+    };
+
+    const RESYNC_REASON = {
+      drift: 'sync drifted over 2 ms',
+      queue_empty: 'audio ran out (network gap)',
+    };
+
+    // Clock correction rate from the snapcast frame counters: frames skipped
+    // (catch up) minus frames repeated (hold back) over the last minute.
+    const CORRECTION_WINDOW_MS = 60000;
+    let corrHistory = [];
+
+    function trackCorrection(s) {
+      if (!has(s.frames_dropped) || !has(s.frames_inserted)) {
+        corrHistory = [];
+        return;
+      }
+      const now = performance.now();
+      const last = corrHistory[corrHistory.length - 1];
+      if (s.player !== 'playing' ||
+          (last && (now - last.t > 3 * POLL_MS ||
+                    s.frames_dropped < last.dropped || s.frames_inserted < last.inserted ||
+                    s.sample_rate !== last.rate))) {
+        // stopped, a gap in the samples (tab hidden, device unreachable),
+        // rebooted or a new format: start over
+        corrHistory = [];
+        if (s.player !== 'playing') return;
+      }
+      corrHistory.push({ t: now, dropped: s.frames_dropped, inserted: s.frames_inserted, rate: s.sample_rate });
+      while (corrHistory.length > 2 && now - corrHistory[1].t >= CORRECTION_WINDOW_MS) {
+        corrHistory.shift();
+      }
+    }
+
+    function correctionText(s) {
+      if (s.player !== 'playing') return null;
+      if (!has(s.frames_dropped) || !has(s.frames_inserted)) {
+        // builds that tune the clock (APLL) instead of inserting samples
+        return CORRECTION[s.correction] || null;
+      }
+      if (corrHistory.length < 2) return 'measuring…';
+      const a = corrHistory[0];
+      const b = corrHistory[corrHistory.length - 1];
+      const secs = (b.t - a.t) / 1000;
+      if (secs < 10 || !b.rate) return 'measuring…';
+      const net = (b.dropped - a.dropped) - (b.inserted - a.inserted);
+      const total = (b.dropped - a.dropped) + (b.inserted - a.inserted);
+      if (total === 0) return `none (last ${Math.round(secs)} s)`;
+      const ppm = net / (b.rate * secs) * 1e6;
+      const dir = ppm > 0 ? 'faster' : ppm < 0 ? 'slower' : 'net zero';
+      const span = Math.round(secs);
+      return `${Math.abs(ppm).toFixed(1)} ppm ${dir} (${total} frames in ${span} s)`;
+    }
+
+    const ROWS = {
+      snapcast: [
+        ['Server', s => {
+          if (!has(s.server_host)) return null;
+          const ip = has(s.server_ip) && s.server_ip !== s.server_host ? ` (${s.server_ip})` : '';
+          return `${s.server_host}:${s.server_port}${ip}`;
+        }],
+        ['Found through', s => DISCOVERY[s.discovery] || null],
+        ['Connection', s => s.connected
+          ? `connected for ${duration(s.connected_s)}`
+          : 'not connected'],
+        ['Connections since boot', s => has(s.connections) ? String(s.connections) : null],
+        ['Client ID', s => s.client_id || null],
+        ['Stream', s => codecFormat(s)],
+        ['Volume', s => volume(s)],
+        ['Buffer', s => has(s.buffer_ms) ? `${s.buffer_ms} ms` : null],
+        ['Latency offset', s => has(s.latency_ms) ? `${s.latency_ms} ms` : null],
+        ['Player', s => {
+          const p = SNAPCAST_PLAYER[s.player] || null;
+          return p && s.player === 'stopped' && s.muted ? `${p} (muted on the server)` : p;
+        }],
+        ['Sync error', s => s.player === 'playing'
+          ? (has(s.sync_error_us) ? micros(s.sync_error_us) : 'measuring…')
+          : null],
+        ['Clock correction', s => correctionText(s)],
+        ['Audio queued', s => has(s.queued_ms) ? `${s.queued_ms} ms` : null],
+        ['Playback interruptions', s => {
+          if (!has(s.hard_resyncs)) return null;
+          if (s.hard_resyncs === 0) return 'none since boot';
+          const why = RESYNC_REASON[s.last_resync_reason];
+          return `${s.hard_resyncs} since boot; last ${ago(s.last_hard_resync_s)}${why ? `, ${why}` : ''}`;
+        }],
+      ],
+      sendspin: [
+        ['State', s => s.running === false ? 'not running (see the device log)' : null],
+        ['Server', s => s.running === false ? null
+          : s.connected ? (s.server_name || 'connected') : 'none connected'],
+        ['Access', s => s.connected ? (s.paired ? 'paired' : 'unpaired') : null],
+        ['Group', s => has(s.group_playing)
+          ? `${s.group_name || 'unnamed'} (${s.group_playing ? 'playing' : 'stopped'})`
+          : null],
+        ['Clock sync', s => s.connected
+          ? (s.time_synced
+              ? (has(s.sync_error_us) ? `synced, ±${micros(s.sync_error_us).replace(/^[+−]/, '')}` : 'synced')
+              : 'not yet')
+          : null],
+        ['Stream', s => s.stream ? (codecFormat(s) || 'starting') : null],
+        ['Audio output', s => s.running === false ? null : s.output_open
+          ? `${format(s.output_rate ? { sample_rate: s.output_rate, bits: s.output_bits } : {}) || 'open'}, snapcast paused`
+          : s.output_failed ? 'could not open it (see the device log); retrying'
+          : s.waiting_for_output ? 'waiting for snapcast to let go' : 'not in use'],
+        ['Volume', s => volume(s)],
+        ['Listening on', s => has(s.port) ? `port ${s.port}` : null],
+        ['Unpaired servers', s => has(s.unpaired_access) ? (s.unpaired_access ? 'allowed' : 'refused') : null],
+        ['Client ID', s => s.client_id || null],
+      ],
+      device: [
+        ['Name', s => s.name || null],
+        ['Firmware', s => s.firmware || null],
+        ['Built', s => has(s.built) ? (has(s.idf) ? `${s.built}, ESP-IDF ${s.idf}` : s.built) : null],
+        ['Running from', s => s.slot || null],
+        ['Uptime', s => duration(s.uptime_s)],
+        ['Last restart', s => s.reset_reason || null],
+        ['IP address', s => s.ip || null],
+        ['WiFi', s => has(s.wifi_ssid)
+          ? `${s.wifi_ssid}${has(s.wifi_channel) ? `, channel ${s.wifi_channel}` : ''}`
+          : null],
+        ['Access point', s => s.wifi_bssid || null],
+        ['Signal', s => signal(s.wifi_rssi)],
+        ['Free RAM', s => has(s.heap_free)
+          ? `${kib(s.heap_free)} (lowest ${kib(s.heap_min)})`
+          : null],
+        ['Free PSRAM', s => has(s.psram_free) && s.psram_size > 0
+          ? `${kib(s.psram_free)} of ${kib(s.psram_size)} (lowest ${kib(s.psram_min)})`
+          : null],
+      ],
+    };
+
+    // ---- rendering (textContent only: names come from the network) ----
+
+    function renderRows(name, data) {
+      const card = document.getElementById(`card-${name}`);
+      if (!data) {
+        card.hidden = true;
+        return;
+      }
+      card.hidden = false;
+      const dl = document.getElementById(`rows-${name}`);
+      const frag = document.createDocumentFragment();
+      for (const [label, fn] of ROWS[name]) {
+        let value = null;
+        try {
+          value = fn(data);
+        } catch (e) {
+          value = null;
+        }
+        if (!has(value)) continue;
+        const dt = document.createElement('dt');
+        dt.textContent = label;
+        const dd = document.createElement('dd');
+        dd.textContent = value;
+        frag.appendChild(dt);
+        frag.appendChild(dd);
+      }
+      dl.replaceChildren(frag);
+    }
+
+    function setBadge(id, text, kind) {
+      const b = document.getElementById(id);
+      b.textContent = text;
+      b.className = `badge ${kind}`;
+    }
+
+    function render(st) {
+      const out = st.output || {};
+      const src = document.getElementById('now-source');
+      const detail = document.getElementById('now-detail');
+      if (out.source === 'snapcast') {
+        src.textContent = 'Playing: Snapcast';
+      } else if (out.source === 'sendspin') {
+        src.textContent = 'Playing: Sendspin';
+      } else {
+        src.textContent = 'Idle';
+      }
+      detail.textContent = out.source && out.source !== 'none' && has(out.sample_rate)
+        ? `Output (AUX and optical): ${format(out)}`
+        : 'Nothing is playing';
+
+      const sc = st.snapcast;
+      if (sc) {
+        trackCorrection(sc);
+        if (sc.player === 'handed_over') setBadge('badge-snapcast', 'paused for Sendspin', 'warn');
+        else if (!sc.connected) setBadge('badge-snapcast', 'not connected', 'off');
+        else if (sc.player === 'playing') setBadge('badge-snapcast', 'playing', 'ok');
+        else setBadge('badge-snapcast', 'connected', 'ok');
+      }
+      const ss = st.sendspin;
+      if (ss) {
+        if (ss.running === false) setBadge('badge-sendspin', 'not running', 'warn');
+        else if (ss.output_open) setBadge('badge-sendspin', 'playing', 'ok');
+        else if (ss.output_failed) setBadge('badge-sendspin', 'output error', 'warn');
+        else if (ss.connected) setBadge('badge-sendspin', 'connected', 'ok');
+        else setBadge('badge-sendspin', 'waiting for a server', 'off');
+      }
+
+      renderRows('snapcast', sc);
+      renderRows('sendspin', ss);
+      renderRows('device', st.device);
+
+      document.getElementById('updated').textContent =
+        `Updated ${new Date().toLocaleTimeString()}`;
+    }
+
+    function setStale(stale) {
+      document.getElementById('offline').style.display = stale ? 'block' : 'none';
+      document.querySelectorAll('.card').forEach(c => c.classList.toggle('stale', stale));
+    }
+
+    // ---- polling: one request at a time, paused while the page is hidden ----
+
+    let timer = null;
+    let inFlight = false;
+
+    async function poll() {
+      timer = null;
+      if (inFlight) return;
+      inFlight = true;
+      // covers the body too: aborting makes a stalled json() reject
+      const controller = new AbortController();
+      const abort = setTimeout(() => controller.abort(), 5000);
+      try {
+        const response = await fetch('/api/status', { cache: 'no-store', signal: controller.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        render(await response.json());
+        setStale(false);
+      } catch (error) {
+        console.error('Status update failed:', error);
+        setStale(true);
+      } finally {
+        clearTimeout(abort);
+        inFlight = false;
+      }
+      schedule();
+    }
+
+    function schedule() {
+      if (timer === null && !inFlight && !document.hidden) {
+        timer = setTimeout(poll, POLL_MS);
+      }
+    }
+
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && timer === null && !inFlight) {
+        poll();
+      }
+    });
+
+    if (BACKEND_URL && new URL(BACKEND_URL, location.href).origin !== location.origin) {
+      // /api/status sends no CORS header on purpose, so it can't be read
+      // from a page served elsewhere (the other tabs can)
+      document.getElementById('now-source').textContent = 'Not available here';
+      document.getElementById('now-detail').textContent =
+        'The Status tab only works on the page the device itself serves.';
+    } else {
+      poll();
+    }
+  </script>
+</body>
+</html>

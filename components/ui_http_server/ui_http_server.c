@@ -48,6 +48,8 @@ extern const uint8_t settings_ui_js_start[] asm("_binary_settings_ui_js_start");
 extern const uint8_t settings_ui_js_end[] asm("_binary_settings_ui_js_end");
 extern const uint8_t styles_css_start[] asm("_binary_styles_css_start");
 extern const uint8_t styles_css_end[] asm("_binary_styles_css_end");
+extern const uint8_t status_html_start[] asm("_binary_status_html_start");
+extern const uint8_t status_html_end[] asm("_binary_status_html_end");
 extern const uint8_t general_settings_html_start[] asm("_binary_general_settings_html_start");
 extern const uint8_t general_settings_html_end[] asm("_binary_general_settings_html_end");
 extern const uint8_t dsp_settings_html_start[] asm("_binary_dsp_settings_html_start");
@@ -73,6 +75,7 @@ static const embedded_file_t embedded_files[] = {
 	{"/index.js", index_js_start, index_js_end, "application/javascript; charset=utf-8"},
 	{"/settings-ui.js", settings_ui_js_start, settings_ui_js_end, "application/javascript; charset=utf-8"},
 	{"/styles.css", styles_css_start, styles_css_end, "text/css; charset=utf-8"},
+	{"/status.html", status_html_start, status_html_end, "text/html; charset=utf-8"},
 	{"/general-settings.html", general_settings_html_start, general_settings_html_end, "text/html; charset=utf-8"},
 	{"/dsp-settings.html", dsp_settings_html_start, dsp_settings_html_end, "text/html; charset=utf-8"},
 	{"/dac-settings.html", dac_settings_html_start, dac_settings_html_end, "text/html; charset=utf-8"},
@@ -643,6 +646,81 @@ static esp_err_t get_capabilities_handler(httpd_req_t *req) {
 }
 
 /*
+ * Status tab: sections registered by the rest of the firmware
+ */
+#define STATUS_MAX_SECTIONS 8
+
+typedef struct {
+	const char *name;
+	ui_status_section_fn fn;
+} status_section_t;
+
+static status_section_t status_sections[STATUS_MAX_SECTIONS];
+static size_t status_section_count = 0;
+static portMUX_TYPE status_sections_mux = portMUX_INITIALIZER_UNLOCKED;
+
+esp_err_t ui_http_add_status_section(const char *name, ui_status_section_fn fn) {
+	if (name == NULL || fn == NULL) {
+		return ESP_ERR_INVALID_ARG;
+	}
+	esp_err_t ret = ESP_ERR_NO_MEM;
+	taskENTER_CRITICAL(&status_sections_mux);
+	if (status_section_count < STATUS_MAX_SECTIONS) {
+		status_sections[status_section_count].name = name;
+		status_sections[status_section_count].fn = fn;
+		status_section_count++;
+		ret = ESP_OK;
+	}
+	taskEXIT_CRITICAL(&status_sections_mux);
+	if (ret != ESP_OK) {
+		ESP_LOGE(TAG, "%s: no room for status section %s", __func__, name);
+	}
+	return ret;
+}
+
+/*
+ * GET /api/status: live state for the Status tab, see ui_http_server.h
+ */
+static esp_err_t status_get_handler(httpd_req_t *req) {
+	ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
+
+	status_section_t sections[STATUS_MAX_SECTIONS];
+	size_t count;
+	taskENTER_CRITICAL(&status_sections_mux);
+	count = status_section_count;
+	memcpy(sections, status_sections, count * sizeof(sections[0]));
+	taskEXIT_CRITICAL(&status_sections_mux);
+
+	char *json = NULL;
+	cJSON *root = cJSON_CreateObject();
+	if (root != NULL) {
+		for (size_t i = 0; i < count; i++) {
+			cJSON *section = cJSON_AddObjectToObject(root, sections[i].name);
+			if (section != NULL) {
+				sections[i].fn(section);
+			}
+		}
+		json = cJSON_PrintUnformatted(root);
+		cJSON_Delete(root);
+	}
+
+	// No CORS header, unlike the settings endpoints, so ordinary pages from
+	// other sites can't read the network details in here. (Like the rest of
+	// this server it doesn't check the Host header, so a DNS-rebinding page
+	// still could; nothing in it is secret.)
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	if (json == NULL) {
+		httpd_resp_set_status(req, "500 Internal Server Error");
+		httpd_resp_set_type(req, "text/plain");
+		return httpd_resp_sendstr(req, "out of memory");
+	}
+	httpd_resp_set_type(req, "application/json");
+	esp_err_t ret = httpd_resp_sendstr(req, json);
+	cJSON_free(json);
+	return ret;
+}
+
+/*
  * favicon get handler
  * Returns 404 since we don't have a favicon
  */
@@ -1066,11 +1144,14 @@ esp_err_t start_server(const char *base_path, int port) {
 	ESP_LOGD(TAG, "%s: base_path=%s port=%d", __func__, base_path, port);
 	httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 	config.server_port = port;
-	// lwIP has 10 sockets (CONFIG_LWIP_MAX_SOCKETS): 3 go to this server's
-	// own use and 2 to the UDP logger, and the snapserver link plus a SYN
-	// must fit CONFIG_LWIP_MAX_ACTIVE_TCP=6; 4 sessions lets LRU purge work
+	// 4 sessions plus this server's 3 internal sockets fit the lwIP budget
+	// next to the snapserver link, the UDP logger and Sendspin (see
+	// CONFIG_LWIP_MAX_SOCKETS in the board settings); LRU purge needs it
 	config.max_open_sockets = 4;
 	config.max_uri_handlers = 64;
+	// handlers print JSON with cJSON (full printf) and copy status snapshots;
+	// internal RAM, as the settings handlers write NVS
+	config.stack_size = 6144;
 	config.lru_purge_enable = true; // Enable LRU socket purging
 
 	/* Enable wildcard URI matching for static file handler */
@@ -1124,6 +1205,14 @@ esp_err_t start_server(const char *base_path, int port) {
 		.handler = get_capabilities_handler,
 	};
 	httpd_register_uri_handler(server, &_get_capabilities_handler);
+
+	/* URI handler for the Status tab's live data */
+	httpd_uri_t _status_get_handler = {
+		.uri = "/api/status",
+		.method = HTTP_GET,
+		.handler = status_get_handler,
+	};
+	httpd_register_uri_handler(server, &_status_get_handler);
 
 	/* URI handler for favicon.ico */
 	httpd_uri_t _favicon_get_handler = {

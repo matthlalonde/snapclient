@@ -7,6 +7,7 @@
 #include "net_functions.h"
 #include "network_interface.h"
 #include "settings_manager.h"
+#include "snapcast_status.h"
 
 // External variable that need to be accessible
 extern struct netconn* lwipNetconn;
@@ -57,6 +58,7 @@ void setup_network(esp_netif_t** netif) {
      * The settings_manager holds the mdns flag and optional server host/port.
      */
     ip_addr_t remote_ip;
+    char server_name[128] = {0};  // for the Status tab
     bool use_mdns = true;
     if (settings_get_mdns_enabled(&use_mdns) != ESP_OK) {
       use_mdns = true;  // default to mdns if error
@@ -132,6 +134,9 @@ void setup_network(esp_netif_t** netif) {
 
       ip_addr_copy(remote_ip, re->addr->addr);
       remotePort = r->port;
+      if (re->hostname != NULL) {
+        snprintf(server_name, sizeof(server_name), "%s.local", re->hostname);
+      }
 
       mdns_query_results_free(r);
 
@@ -179,9 +184,18 @@ void setup_network(esp_netif_t** netif) {
       }
 
       remotePort = (uint16_t)static_port;
+      snprintf(server_name, sizeof(server_name), "%s", static_host);
 
       ESP_LOGI(TAG, "try connecting to static configuration %s:%d",
                ipaddr_ntoa(&remote_ip), remotePort);
+    }
+
+    {
+      char ip_str[IPADDR_STRLEN_MAX];
+      ipaddr_ntoa_r(&remote_ip, ip_str, sizeof(ip_str));
+      snapcast_status_set_server(
+          server_name, ip_str, remotePort,
+          use_mdns ? SNAPCAST_DISCOVERY_MDNS : SNAPCAST_DISCOVERY_STATIC);
     }
 
     if (remote_ip.type == IPADDR_TYPE_V4) {
