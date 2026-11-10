@@ -121,6 +121,13 @@ static void player_task(void *pvParameters);
 bool gotSettings = false;
 bool playerstarted = false;
 
+// Set while another audio source (Sendspin) owns the I2S port: snapcast audio
+// is dropped and the player task gives up its I2S channel. outputMux makes
+// "check the flag, then auto-start the player" in insert_pcm_chunk() atomic
+// against player_release_output().
+static volatile bool outputReleased = false;
+static SemaphoreHandle_t outputMux = NULL;
+
 extern void audio_set_mute(bool mute);
 extern void audio_dac_enable(bool enabled);
 
@@ -497,6 +504,10 @@ int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_) {
     xSemaphoreGive(snapcastSettingsMux);
   }
 
+  if (outputMux == NULL) {
+    outputMux = xSemaphoreCreateMutex();
+  }
+
   /**
   ret = player_setup_i2s(&currentSnapcastSetting);
   if (ret < 0) {
@@ -731,6 +742,8 @@ int32_t player_send_snapcast_setting(snapcastSetting_t *setting) {
           //(curSet.codec == setting->codec) && (curSet.sr == setting->sr) &&
           //(curSet.cDacLat_ms == setting->cDacLat_ms))) == false) {
       // notify needed
+    // the exiting player task deletes the queue under this lock
+    xSemaphoreTake(snapcastSettingsMux, portMAX_DELAY);
     if ((playerTaskHandle != NULL) && (snapcastSettingQueueHandle != NULL)) {
       ret = xQueueOverwrite(snapcastSettingQueueHandle, &settingChanged);
       if (ret != pdPASS) {
@@ -742,6 +755,7 @@ int32_t player_send_snapcast_setting(snapcastSetting_t *setting) {
                   "got settings and notified player_task");
       }
     }
+    xSemaphoreGive(snapcastSettingsMux);
   }
 
   if (!gotSettings && (setting->bits > 0) && ( setting->buf_ms > 0) && (setting->ch > 0) && 
@@ -1384,6 +1398,20 @@ int32_t insert_pcm_chunk(pcm_chunk_message_t *pcmChunk) {
     return -1;
   }
 
+  // Held until the chunk is queued: the player task deletes the queue under
+  // the same lock when it stops (handover or idle), and
+  // player_release_output() must never see the player stopped while a start
+  // is still on its way.
+  xSemaphoreTake(outputMux, portMAX_DELAY);
+
+  if (outputReleased) {
+    // another source owns the I2S output
+    xSemaphoreGive(outputMux);
+    free_pcm_chunk(pcmChunk);
+
+    return -4;
+  }
+
   if (pcmChkQHdl == NULL) {
     ESP_LOGW(TAG, "pcm chunk queue not created. Player started: %s", playerstarted ? "True": "False");
 
@@ -1392,8 +1420,9 @@ int32_t insert_pcm_chunk(pcm_chunk_message_t *pcmChunk) {
     snapcastSetting_t curSet;
     player_get_snapcast_settings(&curSet);
     if (!curSet.muted && gotSettings) {
-        start_player(&curSet);
+      start_player(&curSet);
     }
+    xSemaphoreGive(outputMux);
 
     return -2;
   }
@@ -1401,6 +1430,7 @@ int32_t insert_pcm_chunk(pcm_chunk_message_t *pcmChunk) {
   bool isFull = false;
   latency_buffer_full(&isFull);
   if (isFull == false) {
+    xSemaphoreGive(outputMux);
     free_pcm_chunk(pcmChunk);
 
     //    ESP_LOGW(TAG, "%s: wait for initial latency measurement to finish",
@@ -1423,6 +1453,7 @@ int32_t insert_pcm_chunk(pcm_chunk_message_t *pcmChunk) {
 
     free_pcm_chunk(pcmChunk);
   }
+  xSemaphoreGive(outputMux);
 //free_pcm_chunk(pcmChunk);
 
   return 0;
@@ -1439,6 +1470,81 @@ int32_t pcm_chunk_queue_msg_waiting(void) {
   }
 
   return ret;
+}
+
+/**
+ * Hand the I2S output to another audio source (Sendspin). From now on
+ * snapcast audio is dropped, and a running player task stops and deletes its
+ * I2S channel. Returns 0 once the I2S port is free, -1 if the player is still
+ * running after timeout_ms (the port is then still in use).
+ */
+int player_release_output(uint32_t timeout_ms) {
+  if (outputMux == NULL) {
+    return -1;  // init_player() not called yet
+  }
+
+  xSemaphoreTake(outputMux, portMAX_DELAY);
+  outputReleased = true;
+  xSemaphoreGive(outputMux);
+
+  // the player task notices within one chunk or one 100 ms receive slice
+  TickType_t start = xTaskGetTickCount();
+  while (playerstarted) {
+    if ((xTaskGetTickCount() - start) > pdMS_TO_TICKS(timeout_ms)) {
+      ESP_LOGE(TAG, "player still running %lu ms after output release",
+               (unsigned long)timeout_ms);
+      return -1;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+
+  return 0;
+}
+
+/**
+ * Give the I2S output back to snapcast. The player restarts with the next
+ * snapcast chunk; call only after the other source deleted its I2S channel.
+ */
+void player_reclaim_output(void) {
+  if (outputMux == NULL) {
+    return;
+  }
+
+  xSemaphoreTake(outputMux, portMAX_DELAY);
+  outputReleased = false;
+  xSemaphoreGive(outputMux);
+}
+
+bool player_output_released(void) { return outputReleased; }
+
+/**
+ * The I2S port and pins the player uses (set by init_player()), so another
+ * source can drive the same DAC and S/PDIF transmitter.
+ */
+void player_get_i2s_config(i2s_std_gpio_config_t *pins, i2s_port_t *port) {
+  if (pins) {
+    *pins = pin_config0;
+  }
+  if (port) {
+    *port = i2sNum;
+  }
+}
+
+/**
+ * Wait up to 2 s for the next chunk, as before, but stop waiting as soon as
+ * the output is handed to another source.
+ */
+static BaseType_t player_receive_chunk(pcm_chunk_message_t **chnk) {
+  for (int i = 0; i < 20; i++) {
+    if (xQueueReceive(pcmChkQHdl, chnk, pdMS_TO_TICKS(100)) == pdTRUE) {
+      return pdTRUE;
+    }
+    if (outputReleased) {
+      break;
+    }
+  }
+
+  return pdFAIL;
 }
 
 static bool audioCodecCanSleep = false;
@@ -1516,10 +1622,20 @@ static void player_task(void *pvParameters) {
 //  }
   audio_set_mute(scSet.muted);
 
-  // wait for early time syncs to be ready
-  xSemaphoreTake(latencyBufFullSemaphoreHandle, portMAX_DELAY);
-  xSemaphoreGive(latencyBufFullSemaphoreHandle);
-  while (1) {
+  // wait for early time syncs to be ready, unless the output is handed to
+  // another source meanwhile (the top of the loop below then stops the task)
+  bool latencyBufFull = false;
+  while (!outputReleased) {
+    if (xSemaphoreTake(latencyBufFullSemaphoreHandle, pdMS_TO_TICKS(100)) ==
+        pdTRUE) {
+      latencyBufFull = true;
+      break;
+    }
+  }
+  if (latencyBufFull) {
+    xSemaphoreGive(latencyBufFullSemaphoreHandle);
+  }
+  while (!outputReleased) {
     int64_t tDiff;
     if (get_diff_to_server(&tDiff, esp_timer_get_time())==0) {
       break;
@@ -1528,6 +1644,27 @@ static void player_task(void *pvParameters) {
   }
 
   while (1) {
+    if (outputReleased) {
+      // another source (Sendspin) takes the output: stop now instead of
+      // playing out the queue; the queue itself is freed after the loop
+      if (chnk != NULL) {
+        free_pcm_chunk(chnk);
+        chnk = NULL;
+      }
+
+      ESP_LOGI(TAG, "output handed to another source, stopping player");
+
+      my_gptimer_stop(gptimer);
+      audio_set_mute(true);
+      audio_dac_enable(false);
+      if (i2s_clock_cb) i2s_clock_cb(PLAYER_I2S_DOWN, 0, 0);
+      my_i2s_channel_disable(tx_chan);
+      i2s_del_channel(tx_chan);
+      tx_chan = NULL;
+
+      break;
+    }
+
     //ESP_LOGD(TAG, "HIGH: %u", uxTaskGetStackHighWaterMark( NULL ));
     
     // ESP_LOGW( TAG, "32b f %d b %d", heap_caps_get_free_size
@@ -1628,7 +1765,7 @@ static void player_task(void *pvParameters) {
 
     if (chnk == NULL) {
       if (pcmChkQHdl != NULL) {
-        ret = xQueueReceive(pcmChkQHdl, &chnk, pdMS_TO_TICKS(2000));
+        ret = player_receive_chunk(&chnk);
       } else {
          //ESP_LOGE (TAG, "Couldn't get PCM chunk, pcm queue not created");
 
@@ -1686,7 +1823,7 @@ static void player_task(void *pvParameters) {
           while (1) {
             if (chnk == NULL) {
               if (pcmChkQHdl != NULL) {
-                ret = xQueueReceive(pcmChkQHdl, &chnk, pdMS_TO_TICKS(2000));
+                ret = player_receive_chunk(&chnk);
                 // if (ret != pdFAIL) {
                 //   ESP_LOGI(TAG, "got pcm chunk with size %d",
                 //            chnk->fragment->size);
@@ -1697,8 +1834,12 @@ static void player_task(void *pvParameters) {
               // chnk->fragment->size);
             }
 
-            // If we still don't have a chunk, wait and retry
+            // If we still don't have a chunk, wait and retry, unless the
+            // output was handed to another source
             if (chnk == NULL) {
+              if (outputReleased) {
+                break;
+              }
               continue;
             }
 
@@ -1738,6 +1879,12 @@ static void player_task(void *pvParameters) {
 
               break;
             }
+          }
+
+          if (outputReleased) {
+            // handed over while preloading: the top of the loop stops us
+            my_gptimer_stop(gptimer);
+            continue;
           }
 
           // Wait to be notified of a timer interrupt.
@@ -2182,7 +2329,10 @@ static void player_task(void *pvParameters) {
   esp_pm_lock_release(player_pm_lock_handle);
 #endif
 
+  // insert_pcm_chunk() uses the queue under this lock
+  xSemaphoreTake(outputMux, portMAX_DELAY);
   ret = destroy_pcm_queue(&pcmChkQHdl);
+  xSemaphoreGive(outputMux);
 
   tg0_timer_deinit();
   playerstarted = false;

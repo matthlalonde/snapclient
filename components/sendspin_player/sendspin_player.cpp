@@ -1,0 +1,920 @@
+// Sendspin player for this firmware.
+//
+// The official sendspin-cpp library does the protocol work: the
+// Noise-encrypted WebSocket, clock sync, FLAC/PCM decoding and timed
+// playback. This file connects it to the board:
+//   - the I2S output, which snapcast hands over while a Sendspin stream plays
+//     (player_release_output) and gets back 2 s after the stream ends
+//   - NVS for the device identity (X25519 key) and pairing records
+//   - mDNS (_sendspin._tcp) so Music Assistant finds the player
+//
+// Sync rests on exact playback reports. Every DMA buffer is written whole as
+// [real audio][silence padding], and a lockstep queue records how many real
+// frames each one carries. The I2S on_sent interrupt then tells exactly when
+// real audio finished playing, with startup zeros and padding left out. This
+// is the method ESPHome's I2S speaker uses. The I2S interrupt is IRAM-safe
+// (CONFIG_I2S_ISR_IRAM_SAFE), so flash writes don't stall it.
+
+#include "sendspin_player.h"
+
+#include "sdkconfig.h"
+
+#if CONFIG_SENDSPIN_PLAYER_ENABLE
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <new>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "driver/i2s_std.h"
+#include "esp_app_desc.h"
+#include "esp_attr.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "esp_pm.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "freertos/stream_buffer.h"
+#include "freertos/task.h"
+#include "mdns.h"
+#include "nvs.h"
+#include "player.h"
+#include "sendspin/client.h"
+#include "sendspin/player_role.h"
+
+extern "C" {
+#include "network_interface.h"
+// main.c: DAC enable / mute through the board HAL; also drives the status LED
+void audio_set_mute(bool mute);
+void audio_dac_enable(bool enabled);
+}
+
+namespace {
+
+const char *TAG = "sendspin";
+
+// The one format we advertise. Snapclient's I2S setup (16-bit Philips slots,
+// 32 fs BCK for the PCM5102A's PLL, 256 fs MCLK for the WM8804) is verified
+// on this board at 16 bit; with a single rate the server resamples instead of
+// changing the format mid-stream.
+constexpr uint32_t kSampleRate = 44100;
+constexpr uint8_t kChannels = 2;
+constexpr uint8_t kBits = 16;
+constexpr size_t kFrameBytes = kChannels * kBits / 8;
+
+// 6 x 512 frames = 70 ms of DMA at 44.1 kHz, 12 KB of internal RAM
+constexpr uint32_t kDmaDescNum = 6;
+constexpr uint32_t kDmaFrameNum = 512;
+constexpr size_t kDmaBufBytes = kDmaFrameNum * kFrameBytes;
+constexpr int64_t kDmaBufUs = int64_t(kDmaFrameNum) * 1000000 / kSampleRate;
+// sync task -> output task, 46 ms. Small on purpose: everything queued here
+// delays the start of a stream and still plays after a seek. The library
+// handles partial writes, so chunks larger than this are fine.
+constexpr size_t kPcmBufBytes = 8 * 1024;
+// largest single send: the wait for space then ends after a few DMA buffers
+constexpr size_t kMaxSendBytes = kPcmBufBytes / 2;
+// how long the output task waits for more audio before padding a DMA buffer
+// with silence; well below one buffer (11.6 ms) so the DMA never runs dry
+constexpr TickType_t kFillWaitTicks = pdMS_TO_TICKS(3);
+
+// Startup lead we ask the server for: handover from snapcast (up to ~100 ms
+// while snapcast plays), 70 ms of preloaded DMA silence, the 46 ms PCM
+// buffer, the library's 25 ms priming and 50 ms extra silence, plus margin.
+constexpr uint16_t kRequiredLeadMs = 350;
+
+constexpr uint32_t kHandoverTimeoutMs = 500;  // later attempts come from poll()
+constexpr int64_t kRetryUs = 500 * 1000;
+constexpr int64_t kReleaseDelayUs = 2 * 1000 * 1000;
+constexpr uint32_t kLoopPeriodMs = 20;
+
+constexpr const char *kAppNamespace = "ss_app";  // our own keys
+constexpr const char *kLibNamespace = "sendspin";  // the library's keyspace
+
+// Status tab snapshot: written by the loop task, copied by the web server
+constexpr int64_t kStatusPeriodUs = 250 * 1000;
+sendspin_status_t g_status = {};
+portMUX_TYPE g_status_mux = portMUX_INITIALIZER_UNLOCKED;
+
+void copy_str(char *dst, size_t size, const std::string &src) {
+  size_t n = std::min(src.size(), size - 1);
+  std::memcpy(dst, src.data(), n);
+  dst[n] = '\0';
+}
+
+const char *codec_name(sendspin::SendspinCodecFormat codec) {
+  switch (codec) {
+    case sendspin::SendspinCodecFormat::FLAC:
+      return "flac";
+    case sendspin::SendspinCodecFormat::OPUS:
+      return "opus";
+    case sendspin::SendspinCodecFormat::PCM:
+      return "pcm";
+    default:
+      return "unsupported";
+  }
+}
+
+int32_t volume_to_gain_q15(uint8_t volume, bool muted) {
+  if (muted || volume == 0) {
+    return 0;
+  }
+  if (volume >= 100) {
+    return 32768;
+  }
+  // amplitude = (volume / 100)^1.5, the curve the Sendspin player spec gives
+  return static_cast<int32_t>(lroundf(powf(volume / 100.0f, 1.5f) * 32768.0f));
+}
+
+// ---------------------------------------------------------------------------
+// I2S output
+// ---------------------------------------------------------------------------
+
+class I2sOutput {
+ public:
+  bool init(sendspin::PlayerRole *player) {
+    player_ = player;
+    // a static create gives xLength usable bytes minus one: + 1 keeps the
+    // capacity a whole number of frames, so partial sends stay aligned
+    pcm_ = xStreamBufferCreateWithCaps(kPcmBufBytes + 1, kFrameBytes,
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    // the ISR posts to sent_: internal RAM
+    sent_ = xQueueCreateWithCaps(2 * kDmaDescNum + 4, sizeof(int64_t),
+                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    records_ = xQueueCreate(2 * kDmaDescNum + 4, sizeof(uint32_t));
+    go_ = xSemaphoreCreateBinary();
+    idle_ = xSemaphoreCreateBinary();
+    if (!pcm_ || !sent_ || !records_ || !go_ || !idle_) {
+      ESP_LOGE(TAG, "out of memory for the I2S output");
+      return false;
+    }
+    return xTaskCreatePinnedToCore(&I2sOutput::task_entry, "ss_i2s", 4096,
+                                   this, 14, nullptr, 1) == pdPASS;
+  }
+
+  bool is_open() const { return chan_ != nullptr; }
+  uint32_t sample_rate() const { return sample_rate_; }
+
+  // Main loop thread, with no stream writing: the I2S port must be free
+  // (snapcast released it).
+  bool open(uint32_t sample_rate) {
+    if (chan_ != nullptr) {
+      return true;
+    }
+    i2s_std_gpio_config_t pins;
+    i2s_port_t port;
+    player_get_i2s_config(&pins, &port);
+
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(port, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num = kDmaDescNum;
+    chan_cfg.dma_frame_num = kDmaFrameNum;
+    // a buffer the task did not refill plays as zeros
+    chan_cfg.auto_clear_after_cb = true;
+    esp_err_t err = i2s_new_channel(&chan_cfg, &chan_, nullptr);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "i2s_new_channel: %s", esp_err_to_name(err));
+      chan_ = nullptr;
+      return false;
+    }
+
+    // same clocking as snapclient's player (verified on this board)
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                        I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = pins,
+    };
+    std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_DEFAULT;
+
+    i2s_event_callbacks_t cbs = {};
+    cbs.on_sent = &I2sOutput::on_sent;
+    cbs.on_send_q_ovf = &I2sOutput::on_send_q_ovf;
+
+    err = i2s_channel_init_std_mode(chan_, &std_cfg);
+    if (err == ESP_OK) {
+      // before enabling: the very first transmitted buffer must raise an
+      // event that pairs with the first preloaded record
+      err = i2s_channel_register_event_callback(chan_, &cbs, this);
+    }
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "I2S setup: %s", esp_err_to_name(err));
+      i2s_del_channel(chan_);
+      chan_ = nullptr;
+      return false;
+    }
+
+    sample_rate_ = sample_rate;
+    // nobody writes now: the sync task starts only after on_stream_start
+    xStreamBufferReset(pcm_);
+    if (!start_dma()) {
+      i2s_del_channel(chan_);
+      chan_ = nullptr;
+      return false;
+    }
+
+    run_.store(true);
+    xSemaphoreGive(go_);
+    ESP_LOGI(TAG, "I2S output open: %lu Hz", (unsigned long)sample_rate);
+    return true;
+  }
+
+  // Main loop thread, after the stream ended (the sync task is idle). Frees
+  // the I2S port; whatever is still buffered is dropped.
+  void close() {
+    if (chan_ == nullptr) {
+      return;
+    }
+    run_.store(false);
+    if (xSemaphoreTake(idle_, pdMS_TO_TICKS(1000)) != pdTRUE) {
+      // cannot happen: every wait in the task is bounded well below this
+      ESP_LOGE(TAG, "I2S output task did not stop");
+    }
+    i2s_channel_disable(chan_);
+    i2s_del_channel(chan_);
+    chan_ = nullptr;
+    xQueueReset(sent_);
+    xQueueReset(records_);
+    ESP_LOGI(TAG, "I2S output closed");
+  }
+
+  // Sync task (on_audio_write). Returns whole frames only.
+  size_t write(const uint8_t *data, size_t len, uint32_t timeout_ms) {
+    if (!run_.load()) {
+      // no output yet (the handover is still pending): don't let the sync
+      // task spin; poll() retries the handover
+      vTaskDelay(pdMS_TO_TICKS(timeout_ms));
+      return 0;
+    }
+    len = std::min(len - len % kFrameBytes, kMaxSendBytes);
+    // capacity and every read and write are whole frames, so a partial send
+    // after the timeout is whole frames too
+    size_t n = xStreamBufferSend(pcm_, data, len, pdMS_TO_TICKS(timeout_ms));
+    if (n % kFrameBytes != 0) {
+      ESP_LOGE(TAG, "misaligned PCM write (%u bytes)", (unsigned)n);
+    }
+    return n - n % kFrameBytes;
+  }
+
+  void set_gain(uint8_t volume, bool muted) {
+    gain_target_.store(volume_to_gain_q15(volume, muted));
+  }
+
+ private:
+  static void task_entry(void *arg) { static_cast<I2sOutput *>(arg)->task(); }
+
+  void task() {
+    for (;;) {
+      xSemaphoreTake(go_, portMAX_DELAY);
+      while (run_.load()) {
+        if (!report_played() || !write_one_buffer()) {
+          if (!run_.load()) {
+            break;  // close() raced the error; nothing to repair
+          }
+          ESP_LOGW(TAG, "I2S buffer accounting lost, restarting the output");
+          i2s_channel_disable(chan_);
+          settle_accounting();
+          if (!start_dma()) {
+            ESP_LOGE(TAG, "I2S restart failed");
+            run_.store(false);
+          }
+        }
+      }
+      xSemaphoreGive(idle_);
+    }
+  }
+
+  // Channel disabled: fill every DMA descriptor with silence and record each
+  // as carrying no audio, then start the DMA.
+  bool start_dma() {
+    xQueueReset(sent_);
+    xQueueReset(records_);
+    lockstep_lost_.store(false);
+    std::memset(buf_, 0, sizeof(buf_));
+    for (uint32_t i = 0; i < kDmaDescNum; i++) {
+      size_t loaded = 0;
+      esp_err_t err = i2s_channel_preload_data(chan_, buf_, kDmaBufBytes, &loaded);
+      if (err != ESP_OK || loaded != kDmaBufBytes) {
+        ESP_LOGE(TAG, "DMA preload %lu: %s, %u bytes", (unsigned long)i,
+                 esp_err_to_name(err), (unsigned)loaded);
+        return false;
+      }
+      uint32_t none = 0;
+      xQueueSend(records_, &none, 0);
+    }
+    gain_now_ = gain_target_.load();
+    return i2s_channel_enable(chan_) == ESP_OK;
+  }
+
+  // Before a restart (channel disabled): the library counted every frame we
+  // accepted as buffered until it is reported played. Report what did play
+  // with its real time, and what never will as finishing when the fresh
+  // preload does, so the library's estimate stays right.
+  void settle_accounting() {
+    int64_t sent_at;
+    uint32_t frames;
+    while (xQueueReceive(sent_, &sent_at, 0) == pdTRUE &&
+           xQueueReceive(records_, &frames, 0) == pdTRUE) {
+      report(frames, sent_at);
+    }
+    uint32_t lost = 0;
+    while (xQueueReceive(records_, &frames, 0) == pdTRUE) {
+      lost += frames;
+    }
+    if (lost > 0) {
+      player_->notify_audio_played(lost, esp_timer_get_time() + kDmaDescNum * kDmaBufUs);
+    }
+  }
+
+  void report(uint32_t frames, int64_t sent_at) {
+    if (frames > 0) {
+      // the real audio sits at the start of the buffer: it finished playing
+      // before the trailing silence
+      int64_t pad_us = static_cast<int64_t>(kDmaFrameNum - frames) * 1000000 /
+                       sample_rate_;
+      player_->notify_audio_played(frames, sent_at - pad_us);
+    }
+  }
+
+  // Pair each sent buffer with its record and report the real audio in it.
+  bool report_played() {
+    int64_t sent_at;
+    while (xQueueReceive(sent_, &sent_at, 0) == pdTRUE) {
+      uint32_t frames;
+      if (xQueueReceive(records_, &frames, 0) != pdTRUE) {
+        return false;  // a buffer played that we never wrote
+      }
+      report(frames, sent_at);
+    }
+    return !lockstep_lost_.load();
+  }
+
+  // Write exactly one DMA buffer: the audio we have, then silence.
+  bool write_one_buffer() {
+    size_t got = xStreamBufferReceive(pcm_, buf_, kDmaBufBytes, 0);
+    if (got < kDmaBufBytes) {
+      got += xStreamBufferReceive(pcm_, buf_ + got, kDmaBufBytes - got,
+                                  kFillWaitTicks);
+    }
+    got -= got % kFrameBytes;
+    apply_gain(reinterpret_cast<int16_t *>(buf_), got / sizeof(int16_t));
+    std::memset(buf_ + got, 0, kDmaBufBytes - got);
+
+    size_t written = 0;
+    // blocks until a buffer frees up (one every 11.6 ms)
+    esp_err_t err = i2s_channel_write(chan_, buf_, kDmaBufBytes, &written,
+                                      pdMS_TO_TICKS(200));
+    uint32_t frames = got / kFrameBytes;
+    if (written == kDmaBufBytes) {
+      // record it even if a check below fails: it will play
+      xQueueSend(records_, &frames, 0);
+    }
+    if (err != ESP_OK || written != kDmaBufBytes) {
+      ESP_LOGW(TAG, "I2S write: %s, %u of %u bytes", esp_err_to_name(err),
+               (unsigned)written, (unsigned)kDmaBufBytes);
+      return false;
+    }
+    return true;
+  }
+
+  // Volume, ramped linearly over the buffer so changes don't click.
+  void apply_gain(int16_t *samples, size_t count) {
+    const int32_t target = gain_target_.load();
+    const int32_t start = gain_now_;
+    if (count == 0) {
+      return;
+    }
+    if (start == 32768 && target == 32768) {
+      return;
+    }
+    for (size_t i = 0; i < count; i++) {
+      int32_t g = start + static_cast<int32_t>(
+                              (static_cast<int64_t>(target - start) * i) / count);
+      samples[i] = static_cast<int16_t>((static_cast<int32_t>(samples[i]) * g) >> 15);
+    }
+    gain_now_ = target;
+  }
+
+  static bool on_sent(i2s_chan_handle_t, i2s_event_data_t *, void *ctx);
+  static bool on_send_q_ovf(i2s_chan_handle_t, i2s_event_data_t *, void *ctx);
+
+  sendspin::PlayerRole *player_ = nullptr;
+  i2s_chan_handle_t chan_ = nullptr;
+  uint32_t sample_rate_ = kSampleRate;
+  StreamBufferHandle_t pcm_ = nullptr;
+  QueueHandle_t sent_ = nullptr;     // on_sent timestamps, ISR -> task
+  QueueHandle_t records_ = nullptr;  // real frames per written DMA buffer
+  SemaphoreHandle_t go_ = nullptr;
+  SemaphoreHandle_t idle_ = nullptr;
+  std::atomic<bool> run_{false};
+  std::atomic<bool> lockstep_lost_{false};
+  std::atomic<int32_t> gain_target_{32768};
+  int32_t gain_now_ = 32768;
+  alignas(4) uint8_t buf_[kDmaBufBytes];
+};
+
+// IRAM-safe ISR callbacks: they touch only the internal-RAM queue and flags
+bool IRAM_ATTR I2sOutput::on_sent(i2s_chan_handle_t, i2s_event_data_t *, void *ctx) {
+  auto *self = static_cast<I2sOutput *>(ctx);
+  int64_t now = esp_timer_get_time();
+  BaseType_t woken = pdFALSE;
+  if (xQueueSendFromISR(self->sent_, &now, &woken) != pdTRUE) {
+    // the task fell far behind; it restarts the DMA
+    self->lockstep_lost_.store(true);
+  }
+  return woken == pdTRUE;
+}
+
+// The driver dropped a free buffer the task never took: from here on the
+// buffers no longer match the records, so the task restarts the DMA.
+bool IRAM_ATTR I2sOutput::on_send_q_ovf(i2s_chan_handle_t, i2s_event_data_t *,
+                                        void *ctx) {
+  static_cast<I2sOutput *>(ctx)->lockstep_lost_.store(true);
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Library glue
+// ---------------------------------------------------------------------------
+
+// The library's keyspace: fixed keys of at most 12 characters, all calls on
+// the main loop thread.
+class NvsStore : public sendspin::SendspinPersistenceProvider {
+ public:
+  bool open() {
+    ok_ = nvs_open(kLibNamespace, NVS_READWRITE, &h_) == ESP_OK;
+    if (!ok_) {
+      ESP_LOGE(TAG, "NVS namespace %s unavailable: identity and pairing "
+                    "will not survive a reboot", kLibNamespace);
+    }
+    return ok_;
+  }
+
+  std::optional<std::vector<uint8_t>> load_blob(const std::string &key) override {
+    size_t len = 0;
+    if (!ok_ || nvs_get_blob(h_, key.c_str(), nullptr, &len) != ESP_OK) {
+      return std::nullopt;
+    }
+    std::vector<uint8_t> v(len);
+    if (len > 0 && nvs_get_blob(h_, key.c_str(), v.data(), &len) != ESP_OK) {
+      return std::nullopt;
+    }
+    return v;
+  }
+
+  bool save_blob(const std::string &key, const uint8_t *data, size_t len) override {
+    return ok_ && nvs_set_blob(h_, key.c_str(), data, len) == ESP_OK;
+  }
+
+  bool commit() override { return ok_ && nvs_commit(h_) == ESP_OK; }
+
+ private:
+  nvs_handle_t h_ = 0;
+  bool ok_ = false;
+};
+
+class Network : public sendspin::SendspinNetworkProvider {
+ public:
+  bool is_network_ready() override {
+    esp_netif_ip_info_t ip = {};
+    return network_if_get_ip(&ip) && ip.ip.addr != 0;
+  }
+};
+
+class Player : public sendspin::PlayerRoleListener,
+               public sendspin::SendspinClientListener {
+ public:
+  void attach(sendspin::SendspinClient *client, sendspin::PlayerRole *role,
+              I2sOutput *out) {
+    client_ = client;
+    role_ = role;
+    out_ = out;
+    // held while the library asks for low-latency networking (streaming)
+    esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "sendspin", &cpu_lock_);
+  }
+
+  // ---- PlayerRoleListener ----
+
+  size_t on_audio_write(uint8_t *data, size_t length, uint32_t timeout_ms) override {
+    return out_->write(data, length, timeout_ms);
+  }
+
+  // Main loop thread. For a new stream this runs before the sync task writes
+  // any of it; a start without an end before it changes the active stream
+  // in place while its audio keeps flowing.
+  void on_stream_start() override {
+    const auto &p = role_->get_current_stream_params();
+    uint32_t rate = p.sample_rate.value_or(kSampleRate);
+    ESP_LOGI(TAG, "stream start: %lu Hz, %u ch, %u bit%s", (unsigned long)rate,
+             (unsigned)p.channels.value_or(0), (unsigned)p.bit_depth.value_or(0),
+             stream_active_ ? " (in place)" : "");
+    if (p.channels.value_or(kChannels) != kChannels ||
+        p.bit_depth.value_or(kBits) != kBits || rate != kSampleRate) {
+      // only 44.1 kHz 16-bit stereo is advertised; play it anyway
+      ESP_LOGE(TAG, "server sent a format this player did not offer");
+    }
+
+    stream_active_ = true;
+    release_at_us_ = 0;
+    output_failed_ = false;  // a new stream: no failure seen for it yet
+
+    if (out_->is_open()) {
+      // keep running, never drop audio the library has counted: an
+      // in-place start keeps streaming, and a new stream in the grace period
+      // after an end follows the old one's (already played) tail
+      return;
+    }
+    bool port_free;
+    if (!holding_) {
+      // snapcast stops and frees the I2S port; its audio is dropped from now on
+      holding_ = true;
+      port_free = player_release_output(kHandoverTimeoutMs) == 0;
+    } else {
+      port_free = player_release_output(0) == 0;  // asked earlier: just check
+    }
+    if (!port_free) {
+      ESP_LOGW(TAG, "snapcast still has the output; retrying");
+      retry_at_us_ = esp_timer_get_time() + kRetryUs;
+      return;
+    }
+    open_output();
+  }
+
+  void on_stream_end() override {
+    ESP_LOGI(TAG, "stream end");
+    stream_active_ = false;
+    // keep the output a little longer in case the next stream follows
+    release_at_us_ = esp_timer_get_time() + kReleaseDelayUs;
+  }
+
+  void on_volume_changed(uint8_t volume) override {
+    volume_ = volume;
+    out_->set_gain(volume_, muted_);
+    // saved once the output is closed: a flash write during playback can
+    // stall the output task
+    settings_dirty_ = true;
+  }
+
+  void on_mute_changed(bool muted) override {
+    muted_ = muted;
+    out_->set_gain(volume_, muted_);
+    settings_dirty_ = true;
+  }
+
+  // ---- SendspinClientListener ----
+
+  void on_request_high_performance() override {
+    esp_wifi_get_ps(&saved_ps_);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    if (cpu_lock_) {
+      esp_pm_lock_acquire(cpu_lock_);
+    }
+  }
+
+  void on_release_high_performance() override {
+    esp_wifi_set_ps(saved_ps_);
+    if (cpu_lock_) {
+      esp_pm_lock_release(cpu_lock_);
+    }
+  }
+
+  void on_pairing_succeeded(const std::string &server_id) override {
+    ESP_LOGI(TAG, "paired with server %s", server_id.c_str());
+  }
+
+  void on_pairing_failed(const std::string &server_id,
+                         sendspin::SendspinPairAbortReason) override {
+    ESP_LOGW(TAG, "pairing with server %s failed", server_id.c_str());
+  }
+
+  void on_trust_changed(sendspin::ConnectionTrust trust) override {
+    trust_ = trust;
+    ESP_LOGI(TAG, "server connected (%s)",
+             trust == sendspin::ConnectionTrust::USER ? "paired" : "unpaired");
+  }
+
+  // Deltas (an absent field is unchanged). Kept here rather than read from
+  // get_group_state(), which survives into the next server's connection.
+  // A server switch happens within one protocol tick, so the poll loop may
+  // never see a disconnect: start over when the server changes.
+  void on_group_update(const sendspin::GroupUpdateObject &group) override {
+    auto info = client_->get_server_information();
+    std::string id = info ? info->server_id : std::string();
+    if (id != group_server_id_) {
+      group_server_id_ = id;
+      group_name_.clear();
+      group_playing_ = false;
+    }
+    have_group_ = true;
+    if (group.group_name) {
+      group_name_ = *group.group_name;  // "" when the server cleared it
+    }
+    if (group.playback_state) {
+      group_playing_ = *group.playback_state == sendspin::SendspinPlaybackState::PLAYING;
+    }
+  }
+
+  // the clock filter's uncertainty in microseconds, about every 10 s
+  void on_time_sync_updated(float error) override {
+    if (std::isfinite(error) && error >= 0.0f && error < 1e9f) {
+      sync_error_us_ = static_cast<uint32_t>(error);
+      have_sync_error_ = true;
+    }
+  }
+
+  // ---- loop ----
+
+  // After client.start(): report the volume this player had before reboot.
+  void restore_volume() {
+    volume_ = load_u8("vol").value_or(volume_);
+    muted_ = load_u8("mute").value_or(0) != 0;
+    out_->set_gain(volume_, muted_);
+    role_->update_volume(volume_);
+    role_->update_muted(muted_);
+  }
+
+  // Main loop thread, after every client.loop().
+  void poll() {
+    int64_t now = esp_timer_get_time();
+
+    // a stream waits for snapcast to let go of the output (or for a failed
+    // open): retry, without blocking the loop
+    if (stream_active_ && holding_ && !out_->is_open() && now >= retry_at_us_) {
+      if (player_release_output(0) == 0) {
+        open_output();
+      }
+      if (!out_->is_open()) {
+        retry_at_us_ = now + kRetryUs;
+      }
+    }
+
+    if (holding_ && !stream_active_ && release_at_us_ != 0 && now >= release_at_us_) {
+      release_at_us_ = 0;
+      if (out_->is_open()) {
+        out_->close();
+        audio_set_mute(true);
+        audio_dac_enable(false);
+      }
+      holding_ = false;
+      player_reclaim_output();
+      ESP_LOGI(TAG, "output handed back to snapcast");
+    }
+
+    if (settings_dirty_ && !out_->is_open()) {
+      settings_dirty_ = false;
+      save_u8("vol", volume_);
+      save_u8("mute", muted_ ? 1 : 0);
+    }
+  }
+
+  // Main loop thread, after poll(): refresh the Status tab snapshot. Most
+  // of these getters are main-loop only, so the web server never calls the
+  // library itself.
+  void publish_status(sendspin::SendspinClient *client) {
+    int64_t now = esp_timer_get_time();
+    bool connected = client->is_connected();
+    if (!connected && was_connected_) {
+      // nothing in the library signals a disconnect: forget what belonged
+      // to that server (trust is reported again by every new connection)
+      have_group_ = false;
+      group_server_id_.clear();
+      group_name_.clear();
+      group_playing_ = false;
+      have_sync_error_ = false;
+    }
+    was_connected_ = connected;
+    if (now < next_status_us_) {
+      return;
+    }
+    next_status_us_ = now + kStatusPeriodUs;
+
+    sendspin_status_t st = {};
+    st.running = client->is_started();
+    st.port = CONFIG_SENDSPIN_PLAYER_PORT;
+    copy_str(st.client_id, sizeof(st.client_id), client->client_id());
+    st.unpaired_access = client->is_unpaired_access_enabled();
+
+    st.connected = connected;
+    if (connected) {
+      st.paired = trust_ == sendspin::ConnectionTrust::USER;
+      auto info = client->get_server_information();
+      if (info) {
+        copy_str(st.server_name, sizeof(st.server_name), info->name);
+      }
+      if (have_group_) {
+        st.have_group = true;
+        copy_str(st.group_name, sizeof(st.group_name), group_name_);
+        st.group_playing = group_playing_;
+      }
+      st.time_synced = client->is_time_synced();
+      st.have_sync_error = st.time_synced && have_sync_error_;
+      st.sync_error_us = st.have_sync_error ? sync_error_us_ : 0;
+    }
+
+    st.stream = stream_active_;
+    if (stream_active_) {
+      // the library keeps the last stream's parameters after it ends
+      const auto &p = role_->get_current_stream_params();
+      if (p.codec) {
+        std::snprintf(st.codec, sizeof(st.codec), "%s", codec_name(*p.codec));
+      }
+      st.sample_rate = p.sample_rate.value_or(0);
+      st.bits = p.bit_depth.value_or(0);
+      st.channels = p.channels.value_or(0);
+    }
+    st.output_open = out_->is_open();
+    if (st.output_open) {
+      st.output_rate = out_->sample_rate();
+      st.output_bits = kBits;
+    }
+    st.output_failed = output_failed_ && stream_active_ && holding_ && !st.output_open;
+    st.waiting_for_output =
+        stream_active_ && holding_ && !st.output_open && !st.output_failed;
+    st.volume = volume_;
+    st.muted = muted_;
+
+    taskENTER_CRITICAL(&g_status_mux);
+    g_status = st;
+    taskEXIT_CRITICAL(&g_status_mux);
+  }
+
+ private:
+  void open_output() {
+    output_failed_ = false;
+    if (out_->open(kSampleRate)) {
+      audio_dac_enable(true);
+      audio_set_mute(false);
+    } else {
+      output_failed_ = true;  // snapcast let go; our own I2S setup failed
+      retry_at_us_ = esp_timer_get_time() + kRetryUs;
+    }
+  }
+
+  static std::optional<uint8_t> load_u8(const char *key) {
+    nvs_handle_t h;
+    uint8_t v = 0;
+    if (nvs_open(kAppNamespace, NVS_READONLY, &h) != ESP_OK) {
+      return std::nullopt;
+    }
+    esp_err_t err = nvs_get_u8(h, key, &v);
+    nvs_close(h);
+    return err == ESP_OK ? std::optional<uint8_t>(v) : std::nullopt;
+  }
+
+  static void save_u8(const char *key, uint8_t v) {
+    nvs_handle_t h;
+    if (nvs_open(kAppNamespace, NVS_READWRITE, &h) == ESP_OK) {
+      nvs_set_u8(h, key, v);  // NVS skips the write when nothing changed
+      nvs_commit(h);
+      nvs_close(h);
+    }
+  }
+
+  sendspin::SendspinClient *client_ = nullptr;
+  sendspin::PlayerRole *role_ = nullptr;
+  I2sOutput *out_ = nullptr;
+  bool stream_active_ = false;
+  bool holding_ = false;  // snapcast was asked to release the output
+  int64_t release_at_us_ = 0;
+  int64_t retry_at_us_ = 0;
+  // first-boot volume: 30 -> -15.7 dB, about where snapcast sits here
+  uint8_t volume_ = 30;
+  bool muted_ = false;
+  bool settings_dirty_ = false;
+  wifi_ps_type_t saved_ps_ = WIFI_PS_MIN_MODEM;
+  esp_pm_lock_handle_t cpu_lock_ = nullptr;
+  // Status tab
+  sendspin::ConnectionTrust trust_ = sendspin::ConnectionTrust::NONE;
+  bool was_connected_ = false;
+  bool have_group_ = false;
+  std::string group_server_id_;
+  std::string group_name_;
+  bool group_playing_ = false;
+  bool output_failed_ = false;
+  bool have_sync_error_ = false;
+  uint32_t sync_error_us_ = 0;
+  int64_t next_status_us_ = 0;
+};
+
+// Static, so it is in internal RAM: the IRAM-safe I2S driver requires the
+// callback context there (a plain `new` may land in PSRAM).
+I2sOutput g_output;
+std::string g_name;
+
+void loop_task(void *) {
+  // Everything here lives as long as the firmware runs.
+  sendspin::SendspinClientConfig cfg;
+  cfg.name = g_name;
+  cfg.product_name = "ESP32-S3 snapclient";
+  cfg.software_version = esp_app_get_description()->version;
+  cfg.server_port = CONFIG_SENDSPIN_PLAYER_PORT;
+  // task stacks that never touch flash go to PSRAM to spare internal RAM.
+  // Larger than the library defaults: those leave ~200 B of slack, measured
+  // at -Os on the ESP32, and every log line here also runs the UDP logger's
+  // vprintf hook (~600 B).
+  cfg.httpd_psram_stack = true;
+  cfg.httpd_stack_size = 6144;
+  cfg.protocol_task_psram_stack = true;
+  cfg.protocol_task_stack_size = 9216;
+  auto *client = new sendspin::SendspinClient(std::move(cfg));
+
+  sendspin::PlayerRoleConfig pcfg;
+  pcfg.audio_formats = {
+      {sendspin::SendspinCodecFormat::FLAC, kChannels, kSampleRate, kBits},
+      {sendspin::SendspinCodecFormat::PCM, kChannels, kSampleRate, kBits},
+  };
+  // ~5 s of FLAC; the inbound ring sized from it lives in PSRAM
+  pcfg.audio_buffer_capacity = 500000;
+  pcfg.required_lead_time_ms = kRequiredLeadMs;
+  // decode must stay ahead of the output task (14) but needs no more
+  pcfg.priority = 12;
+  sendspin::PlayerRole &role = client->add_player(std::move(pcfg));
+
+  auto *player = new Player();
+  auto *store = new NvsStore();
+  auto *net = new Network();
+  player->attach(client, &role, &g_output);
+
+  if (!g_output.init(&role)) {
+    vTaskDelete(nullptr);
+    return;
+  }
+  store->open();
+
+  role.set_listener(player);
+  client->set_listener(player);
+  client->set_network_provider(net);
+  client->set_persistence_provider(store);
+#if CONFIG_SENDSPIN_UNPAIRED_ACCESS
+  client->set_unpaired_access_enabled(true);
+#else
+  client->set_unpaired_access_enabled(false);
+#endif
+
+  if (!client->start()) {
+    ESP_LOGE(TAG, "Sendspin client did not start");
+    vTaskDelete(nullptr);
+    return;
+  }
+  player->restore_volume();
+
+  mdns_txt_item_t txt[] = {
+      {"path", "/sendspin"},
+      {"name", g_name.c_str()},
+  };
+  esp_err_t err = mdns_service_add(g_name.c_str(), "_sendspin", "_tcp",
+                                   CONFIG_SENDSPIN_PLAYER_PORT, txt, 2);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "mDNS service: %s", esp_err_to_name(err));
+  }
+
+  ESP_LOGI(TAG, "Sendspin player \"%s\" on port %d, client id %s",
+           g_name.c_str(), CONFIG_SENDSPIN_PLAYER_PORT,
+           client->client_id().c_str());
+
+  for (;;) {
+    client->loop();
+    player->poll();
+    player->publish_status(client);
+    vTaskDelay(pdMS_TO_TICKS(kLoopPeriodMs));
+  }
+}
+
+}  // namespace
+
+extern "C" bool sendspin_player_get_status(sendspin_status_t *out) {
+  taskENTER_CRITICAL(&g_status_mux);
+  *out = g_status;
+  taskEXIT_CRITICAL(&g_status_mux);
+  return out->running;
+}
+
+extern "C" void sendspin_player_start(const char *name) {
+  g_name = (name && name[0]) ? name : "snapclient";
+  // NVS writes happen on this task (persistence provider, volume), so its
+  // stack stays in internal RAM
+  if (xTaskCreatePinnedToCore(loop_task, "sendspin", 6144, nullptr, 4,
+                              nullptr, tskNO_AFFINITY) != pdPASS) {
+    ESP_LOGE(TAG, "could not start the Sendspin task");
+  }
+}
+
+#else  // !CONFIG_SENDSPIN_PLAYER_ENABLE
+
+#include <cstring>
+
+extern "C" void sendspin_player_start(const char *) {}
+
+extern "C" bool sendspin_player_get_status(sendspin_status_t *out) {
+  std::memset(out, 0, sizeof(*out));
+  return false;
+}
+
+#endif

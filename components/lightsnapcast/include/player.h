@@ -116,6 +116,16 @@ int32_t reset_latency_buffer(void);
 int32_t server_now(int64_t *sNow, int64_t *diff2Server);
 
 int32_t pcm_chunk_queue_msg_waiting(void);
+
+// Sharing the I2S output with another audio source (Sendspin):
+// player_release_output() drops snapcast audio from now on and waits until
+// the player task has deleted its I2S channel (0), or gives up after
+// timeout_ms (-1, the port is then still in use). player_reclaim_output()
+// hands the output back; the player restarts with the next snapcast chunk.
+int player_release_output(uint32_t timeout_ms);
+void player_reclaim_output(void);
+bool player_output_released(void);
+void player_get_i2s_config(i2s_std_gpio_config_t *pins, i2s_port_t *port);
 #ifdef __cplusplus
 }
 #endif

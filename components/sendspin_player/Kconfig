@@ -1,0 +1,35 @@
+menu "Sendspin player"
+
+    config SENDSPIN_PLAYER_ENABLE
+        bool "Sendspin player (Music Assistant)"
+        # its buffers live in PSRAM; the WM8804 I2C driver's clock hook and
+        # slave mode are not wired into the Sendspin output yet
+        depends on SPIRAM && !SPDIF_WM8804
+        default n
+        help
+            Play Sendspin streams (Music Assistant's synchronized audio
+            protocol) next to snapcast. While a Sendspin stream plays it owns
+            the audio output; snapcast plays again 2 s after it ends.
+            Needs PSRAM and ESP-IDF 5.5.2 or later. Not available with the
+            WM8804 I2C driver (SPDIF_WM8804) yet.
+
+    config SENDSPIN_PLAYER_PORT
+        int "Sendspin WebSocket port"
+        depends on SENDSPIN_PLAYER_ENABLE
+        range 1 65535
+        default 8928
+        help
+            The server (Music Assistant) connects to this port. 8928 is the
+            port the Sendspin spec recommends.
+
+    config SENDSPIN_UNPAIRED_ACCESS
+        bool "Let servers play without pairing"
+        depends on SENDSPIN_PLAYER_ENABLE
+        default y
+        help
+            With this on, any Sendspin server on the network may play on this
+            device without pairing first; Music Assistant then adds it with
+            no setup step (the same default ESPHome uses). Turn it off to
+            accept only paired servers.
+
+endmenu

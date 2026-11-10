@@ -1,0 +1,10 @@
+dependencies:
+  # Official Sendspin client (Open Home Foundation, Apache-2.0), only when the
+  # player is enabled. It needs ESP-IDF >= 5.5.2 and says so itself. Pinned:
+  # the API still changes between minor versions. 0.9.x speaks Sendspin
+  # 1.0.0-rc1 (Noise-encrypted), which Music Assistant 2.10.7 and later accept.
+  sendspin/sendspin-cpp:
+    version: "==0.9.5"
+    rules:
+      - if: "$CONFIG{SENDSPIN_PLAYER_ENABLE} == True"
+  espressif/mdns: ">=1.2.3"

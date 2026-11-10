@@ -78,6 +78,7 @@ static bool spdif_i2s_clock_cb(player_i2s_event_t event, uint32_t sample_rate,
 #endif
 #include "ota_server.h"
 #include "player.h"
+#include "sendspin_player.h"
 #include "settings_manager.h"
 #include "snapcast.h"
 #include "snapcast_protocol_parser.h"
@@ -591,7 +592,11 @@ void server_settings_msg_received(
       dsp_processor_set_volome((double)server_settings_message->volume / 100);
     }
 #endif
-    audio_set_mute(server_settings_message->muted);
+    // while Sendspin owns the output, the mute line and LED are its business;
+    // the player applies scSet->muted again when it restarts
+    if (!player_output_released()) {
+      audio_set_mute(server_settings_message->muted);
+    }
   }
 
   if (scSet->volume != server_settings_message->volume) {
@@ -1038,8 +1043,9 @@ int process_data(snapcast_protocol_parser_t *parser,
     case SNAPCAST_MESSAGE_WIRE_CHUNK: {
       wire_chunk_message_t wire_chnk = {{0, 0}, 0, NULL};  // is wire_chnk.payload ever used?
 
-      // skip this wires chunk message if codec header message was not received yet!
-      if (*received_codec_header == false) {
+      // skip this wires chunk message if codec header message was not received yet,
+      // or while another source (Sendspin) owns the audio output
+      if (*received_codec_header == false || player_output_released()) {
         if (parser_skip_typed_message(parser, &base_message_rx) != PARSER_OK) {
           return -1;
         }
@@ -1608,6 +1614,11 @@ void app_main(void) {
   //  websocket_if_start();
 
   net_mdns_register(mdns_hostname);
+#if CONFIG_SENDSPIN_PLAYER_ENABLE
+  // Music Assistant's Sendspin; takes the I2S output from snapcast while
+  // its streams play
+  sendspin_player_start(mdns_hostname);
+#endif
 #ifdef CONFIG_SNAPCLIENT_SNTP_ENABLE
   set_time_from_sntp();
 #endif
