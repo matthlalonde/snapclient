@@ -51,6 +51,9 @@
 #include "player.h"
 #include "sendspin/client.h"
 #include "sendspin/player_role.h"
+#if CONFIG_SENDSPIN_ENABLE_METADATA
+#include "sendspin/metadata_role.h"
+#endif
 
 extern "C" {
 #include "event_log.h"
@@ -105,6 +108,9 @@ constexpr const char *kLibNamespace = "sendspin";  // the library's keyspace
 constexpr int64_t kStatusPeriodUs = 250 * 1000;
 sendspin_status_t g_status = {};
 portMUX_TYPE g_status_mux = portMUX_INITIALIZER_UNLOCKED;
+// what is playing: written by the loop task (metadata listener, progress)
+sendspin_now_playing_t g_np = {};
+portMUX_TYPE g_np_mux = portMUX_INITIALIZER_UNLOCKED;
 
 void copy_str(char *dst, size_t size, const std::string &src) {
   size_t n = std::min(src.size(), size - 1);
@@ -835,6 +841,88 @@ class Player : public sendspin::PlayerRoleListener,
   int64_t next_status_us_ = 0;
 };
 
+#if CONFIG_SENDSPIN_ENABLE_METADATA
+// at most size-1 bytes, never splitting a UTF-8 character
+void copy_utf8(char *dst, size_t size, const std::string &src) {
+  size_t n = std::min(src.size(), size - 1);
+  if (n < src.size()) {
+    // src[n] is the first byte left out: if it continues a character, that
+    // character started earlier; cut before it
+    while (n > 0 && (static_cast<unsigned char>(src[n]) & 0xC0) == 0x80) {
+      n--;
+    }
+  }
+  std::memcpy(dst, src.data(), n);
+  dst[n] = '\0';
+}
+
+// Track details for the Status tab. Not for the event log: one entry per
+// song would push everything else out of it within hours.
+class NowPlaying : public sendspin::MetadataRoleListener {
+ public:
+  void attach(sendspin::MetadataRole *role) { role_ = role; }
+
+  // Main loop thread. Each state is complete: a field left out is unknown.
+  void on_metadata(const sendspin::ServerMetadataStateObject &m) override {
+    // ~1 KB: a member, not on the loop task's stack
+    sendspin_now_playing_t &np = scratch_;
+    np = {};
+    np.valid = true;
+    if (m.title) copy_utf8(np.title, sizeof(np.title), *m.title);
+    if (m.artist) copy_utf8(np.artist, sizeof(np.artist), *m.artist);
+    if (m.album_artist) {
+      copy_utf8(np.album_artist, sizeof(np.album_artist), *m.album_artist);
+    }
+    if (m.album) copy_utf8(np.album, sizeof(np.album), *m.album);
+    // the browser loads it from the server: only a whole http(s) URL
+    if (m.artwork_url && m.artwork_url->size() < sizeof(np.artwork_url) &&
+        (m.artwork_url->rfind("http://", 0) == 0 ||
+         m.artwork_url->rfind("https://", 0) == 0)) {
+      copy_utf8(np.artwork_url, sizeof(np.artwork_url), *m.artwork_url);
+    }
+    np.year = m.year.value_or(0);
+    np.track = m.track.value_or(0);
+    np.has_progress = m.progress.has_value();
+    if (np.has_progress && role_ != nullptr) {
+      np.progress_ms = role_->get_track_progress_ms();
+      np.duration_ms = role_->get_track_duration_ms();
+    }
+    has_progress_ = np.has_progress;
+    taskENTER_CRITICAL(&g_np_mux);
+    g_np = np;
+    taskEXIT_CRITICAL(&g_np_mux);
+  }
+
+  void on_metadata_clear() override {
+    has_progress_ = false;
+    taskENTER_CRITICAL(&g_np_mux);
+    g_np.valid = false;
+    taskEXIT_CRITICAL(&g_np_mux);
+  }
+
+  // Main loop thread: keep the position current (the role interpolates it)
+  void poll() {
+    int64_t now = esp_timer_get_time();
+    if (role_ == nullptr || !has_progress_ || now < next_us_) {
+      return;
+    }
+    next_us_ = now + kStatusPeriodUs;
+    uint32_t progress = role_->get_track_progress_ms();
+    uint32_t duration = role_->get_track_duration_ms();
+    taskENTER_CRITICAL(&g_np_mux);
+    g_np.progress_ms = progress;
+    g_np.duration_ms = duration;
+    taskEXIT_CRITICAL(&g_np_mux);
+  }
+
+ private:
+  sendspin::MetadataRole *role_ = nullptr;
+  bool has_progress_ = false;
+  int64_t next_us_ = 0;
+  sendspin_now_playing_t scratch_ = {};
+};
+#endif
+
 // Static, so it is in internal RAM: the IRAM-safe I2S driver requires the
 // callback context there (a plain `new` may land in PSRAM).
 I2sOutput g_output;
@@ -882,6 +970,13 @@ void loop_task(void *) {
 
   role.set_listener(player);
   client->set_listener(player);
+#if CONFIG_SENDSPIN_ENABLE_METADATA
+  // roles must be added before start(): they go into the hello
+  auto *now_playing = new NowPlaying();
+  sendspin::MetadataRole &metadata = client->add_metadata();
+  now_playing->attach(&metadata);
+  metadata.set_listener(now_playing);
+#endif
   client->set_network_provider(net);
   client->set_persistence_provider(store);
 #if CONFIG_SENDSPIN_UNPAIRED_ACCESS
@@ -915,6 +1010,9 @@ void loop_task(void *) {
     client->loop();
     player->poll();
     player->publish_status(client);
+#if CONFIG_SENDSPIN_ENABLE_METADATA
+    now_playing->poll();
+#endif
     vTaskDelay(pdMS_TO_TICKS(kLoopPeriodMs));
   }
 }
@@ -926,6 +1024,13 @@ extern "C" bool sendspin_player_get_status(sendspin_status_t *out) {
   *out = g_status;
   taskEXIT_CRITICAL(&g_status_mux);
   return out->running;
+}
+
+extern "C" bool sendspin_player_get_now_playing(sendspin_now_playing_t *out) {
+  taskENTER_CRITICAL(&g_np_mux);
+  *out = g_np;
+  taskEXIT_CRITICAL(&g_np_mux);
+  return out->valid;
 }
 
 extern "C" void sendspin_player_start(const char *name) {
@@ -945,6 +1050,11 @@ extern "C" void sendspin_player_start(const char *name) {
 extern "C" void sendspin_player_start(const char *) {}
 
 extern "C" bool sendspin_player_get_status(sendspin_status_t *out) {
+  std::memset(out, 0, sizeof(*out));
+  return false;
+}
+
+extern "C" bool sendspin_player_get_now_playing(sendspin_now_playing_t *out) {
   std::memset(out, 0, sizeof(*out));
   return false;
 }

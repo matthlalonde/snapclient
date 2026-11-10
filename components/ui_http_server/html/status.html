@@ -54,6 +54,28 @@
       gap: 12px;
     }
 
+    .now-main {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-width: 0;
+    }
+
+    .art {
+      width: 72px;
+      height: 72px;
+      flex: 0 0 auto;
+      object-fit: cover;
+      border-radius: 6px;
+      background-color: #e9ecef;
+    }
+
+    .now-track {
+      font-size: 15px;
+      margin-top: 4px;
+      overflow-wrap: anywhere;
+    }
+
     .now-source {
       font-size: 22px;
       font-weight: bold;
@@ -205,9 +227,13 @@
   <div class="cards">
     <div class="card" id="card-now">
       <div class="now">
-        <div>
-          <div class="now-source" id="now-source">Loading&hellip;</div>
-          <div class="now-detail" id="now-detail"></div>
+        <div class="now-main">
+          <img class="art" id="now-art" alt="" referrerpolicy="no-referrer" hidden>
+          <div>
+            <div class="now-source" id="now-source">Loading&hellip;</div>
+            <div class="now-track" id="now-track" hidden></div>
+            <div class="now-detail" id="now-detail"></div>
+          </div>
         </div>
         <div class="updated" id="updated"></div>
       </div>
@@ -221,6 +247,10 @@
     <div class="card" id="card-sendspin" hidden>
       <h2>Sendspin <span class="badge" id="badge-sendspin"></span></h2>
       <dl id="rows-sendspin"></dl>
+      <div class="actions" id="art-actions" hidden>
+        <button class="btn btn-secondary" id="art-toggle" type="button">Hide cover art</button>
+        <span class="hint">This browser loads it from the server's link.</span>
+      </div>
     </div>
 
     <div class="card" id="card-wifi" hidden>
@@ -314,6 +344,21 @@
     function ago(s) {
       const d = duration(s);
       return d ? `${d} ago` : null;
+    }
+
+    function mmss(ms) {
+      if (!has(ms)) return null;
+      const t = Math.max(0, Math.floor(ms / 1000));
+      const h = Math.floor(t / 3600);
+      const m = Math.floor((t % 3600) / 60);
+      const sec = String(t % 60).padStart(2, '0');
+      return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
+    }
+
+    function trackLine(np) {
+      if (!np || !has(np.title)) return null;
+      const by = np.artist || np.album_artist;
+      return by ? `${np.title} — ${by}` : np.title;
     }
 
     function signal(rssi) {
@@ -483,6 +528,23 @@
               ? (has(s.sync_error_us) ? `synced, ±${micros(s.sync_error_us).replace(/^[+−]/, '')}` : 'synced')
               : 'not yet')
           : null],
+        ['Track', s => trackLine(s.now_playing)],
+        ['Album', s => {
+          const np = s.now_playing;
+          if (!np || !has(np.album)) return null;
+          const extra = [];
+          if (has(np.track)) extra.push(`track ${np.track}`);
+          if (has(np.year)) extra.push(String(np.year));
+          return extra.length ? `${np.album} (${extra.join(', ')})` : np.album;
+        }],
+        ['Position', s => {
+          const np = s.now_playing;
+          if (!np || !has(np.progress_ms)) return null;
+          // a duration of 0 means live or unknown
+          return np.duration_ms > 0
+            ? `${mmss(np.progress_ms)} / ${mmss(np.duration_ms)}`
+            : mmss(np.progress_ms);
+        }],
         ['Stream', s => s.stream ? (codecFormat(s) || 'starting') : null],
         ['Audio output', s => s.running === false ? null : s.output_open
           ? `${format(s.output_rate ? { sample_rate: s.output_rate, bits: s.output_bits } : {}) || 'open'}, snapcast paused`
@@ -539,6 +601,58 @@
       dl.replaceChildren(frag);
     }
 
+    // Cover art, loaded by this browser from the URL the Sendspin server
+    // sent (the board never handles images). Any Sendspin server on the LAN
+    // can pick that URL while unpaired access is on, so each browser can
+    // switch it off; the choice is kept in this browser only.
+    function artEnabled() {
+      try {
+        return localStorage.getItem('statusCoverArt') !== 'off';
+      } catch (e) {
+        return true;
+      }
+    }
+
+    function setArtEnabled(on) {
+      try {
+        localStorage.setItem('statusCoverArt', on ? 'on' : 'off');
+      } catch (e) {
+        // private mode: only for this page view
+      }
+      artSwitchedOff = !on;
+      artUrl = null;
+      updateArtToggle();
+    }
+
+    let artSwitchedOff = !artEnabled();
+    let artUrl = null;
+    function showArt(url) {
+      const img = document.getElementById('now-art');
+      const ok = !artSwitchedOff && typeof url === 'string' && /^https?:\/\//i.test(url);
+      if (!ok) {
+        artUrl = null;
+        img.hidden = true;
+        img.removeAttribute('src');
+        return;
+      }
+      if (url !== artUrl) {
+        artUrl = url;
+        img.hidden = true;
+        img.onload = () => { img.hidden = false; };
+        img.onerror = () => {
+          img.hidden = true;
+          // try the same picture again in 30 s, not on every poll
+          setTimeout(() => { if (artUrl === url) artUrl = null; }, 30000);
+        };
+        img.src = url;
+      }
+    }
+
+    function updateArtToggle() {
+      const btn = document.getElementById('art-toggle');
+      btn.textContent = artSwitchedOff ? 'Show cover art' : 'Hide cover art';
+    }
+
     function setBadge(id, text, kind) {
       const b = document.getElementById(id);
       b.textContent = text;
@@ -559,6 +673,14 @@
       detail.textContent = out.source && out.source !== 'none' && has(out.sample_rate)
         ? `Output (AUX and optical): ${format(out)}`
         : 'Nothing is playing';
+      const np = out.source === 'sendspin' && st.sendspin ? st.sendspin.now_playing : null;
+      const track = document.getElementById('now-track');
+      const line = trackLine(np);
+      track.textContent = line || '';
+      track.hidden = !line;
+      showArt(np && np.artwork_url);
+      const anyArt = st.sendspin && st.sendspin.now_playing && has(st.sendspin.now_playing.artwork_url);
+      document.getElementById('art-actions').hidden = !anyArt;
 
       const sc = st.snapcast;
       if (sc) {
@@ -790,6 +912,8 @@
     }
 
     document.getElementById('scan-btn').addEventListener('click', scanNow);
+    document.getElementById('art-toggle').addEventListener('click', () => setArtEnabled(artSwitchedOff));
+    updateArtToggle();
 
     function setStale(stale) {
       document.getElementById('offline').style.display = stale ? 'block' : 'none';

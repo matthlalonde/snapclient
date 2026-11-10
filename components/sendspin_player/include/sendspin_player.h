@@ -48,6 +48,28 @@ typedef struct {
  */
 bool sendspin_player_get_status(sendspin_status_t *out);
 
+/** What the Sendspin server says is playing (CONFIG_SENDSPIN_ENABLE_METADATA). */
+typedef struct {
+  bool valid;             // the server sent track details on this connection
+  char title[128];        // texts are cut at a character boundary
+  char artist[128];
+  char album_artist[128];
+  char album[128];
+  char artwork_url[512];  // "" if none, too long, or not a full http(s) URL
+  uint16_t year;          // 0 = unknown
+  uint16_t track;         // 0 = unknown
+  bool has_progress;
+  uint32_t progress_ms;   // kept current about every 250 ms
+  uint32_t duration_ms;   // 0 = unknown or a live stream
+} sendspin_now_playing_t;
+
+/**
+ * Copy what is playing. Returns false when nothing is known (no metadata
+ * yet, no server, or metadata not built in). Any task; never blocks. ~1 KB:
+ * not for a stack, use a heap or static buffer.
+ */
+bool sendspin_player_get_now_playing(sendspin_now_playing_t *out);
+
 /**
  * Start the Sendspin player (Music Assistant's synchronized audio protocol)
  * under the given display name. It listens for servers on

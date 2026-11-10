@@ -11,6 +11,7 @@
 #include "status_sections.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cJSON.h"
@@ -252,6 +253,30 @@ static void sendspin_section(cJSON *o) {
   cJSON_AddBoolToObject(o, "output_failed", s.output_failed);
   cJSON_AddNumberToObject(o, "volume", s.volume);
   cJSON_AddBoolToObject(o, "muted", s.muted);
+
+  // what the server says is playing (metadata role): ~1 KB, so on the heap
+  sendspin_now_playing_t *np = malloc(sizeof(*np));
+  if (np != NULL && sendspin_player_get_now_playing(np)) {
+    cJSON *n = cJSON_AddObjectToObject(o, "now_playing");
+    if (n != NULL) {
+      if (np->title[0]) cJSON_AddStringToObject(n, "title", np->title);
+      if (np->artist[0]) cJSON_AddStringToObject(n, "artist", np->artist);
+      if (np->album_artist[0]) {
+        cJSON_AddStringToObject(n, "album_artist", np->album_artist);
+      }
+      if (np->album[0]) cJSON_AddStringToObject(n, "album", np->album);
+      if (np->artwork_url[0]) {
+        cJSON_AddStringToObject(n, "artwork_url", np->artwork_url);
+      }
+      if (np->year) cJSON_AddNumberToObject(n, "year", np->year);
+      if (np->track) cJSON_AddNumberToObject(n, "track", np->track);
+      if (np->has_progress) {
+        cJSON_AddNumberToObject(n, "progress_ms", np->progress_ms);
+        cJSON_AddNumberToObject(n, "duration_ms", np->duration_ms);
+      }
+    }
+  }
+  free(np);
 }
 #endif
 
