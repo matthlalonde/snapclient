@@ -1,0 +1,44 @@
+menu "Rescue / setup access point"
+
+    config RESCUE_MODE_ENABLE
+        bool "Enable the rescue access point"
+        default n
+        help
+            For boards without a serial port. Instead of starting
+            snapclient, the firmware opens a WiFi access point
+            ("snapclient-XXXX") with a web page at http://192.168.4.1
+            that sets the WiFi credentials, uploads new firmware (.bin) and
+            switches between installed firmware slots. It is entered when:
+              - the rescue button is held while the board powers up,
+              - the button is held for 5 seconds while running,
+              - no IP address was obtained within the timeout below.
+            After the idle time below without any web request, the board
+            reboots and tries normal operation again.
+
+    config RESCUE_BUTTON_GPIO
+        int "Rescue button GPIO (-1 = none)"
+        depends on RESCUE_MODE_ENABLE
+        range -1 48
+        default -1
+
+    config RESCUE_BUTTON_ACTIVE_LOW
+        bool "Button pulls the pin LOW when pressed"
+        depends on RESCUE_MODE_ENABLE
+        default y
+
+    config RESCUE_NO_IP_TIMEOUT_S
+        int "Enter rescue mode if no IP after (seconds, 0 = never)"
+        depends on RESCUE_MODE_ENABLE
+        default 180
+
+    config RESCUE_IDLE_REBOOT_S
+        int "Leave rescue mode after this many idle seconds (0 = never)"
+        depends on RESCUE_MODE_ENABLE
+        default 600
+
+    config RESCUE_AP_PASSWORD
+        string "Rescue access point password (8+ chars, empty = open)"
+        depends on RESCUE_MODE_ENABLE
+        default "snapclient"
+
+endmenu

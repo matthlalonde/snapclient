@@ -53,6 +53,8 @@
 // flac decoder is implemented as a subcomponet from master git repo
 #include "FLAC/stream_decoder.h"
 #include "connection_handler.h"
+#include "status_led.h"
+#include "web_rescue.h"
 #if CONFIG_SPDIF_WM8804
 #include "player.h"
 #include "wm8804.h"
@@ -1155,6 +1157,8 @@ static void http_get_task(void *pvParameters) {
   while (1) {
     // do some house keeping
     {
+      status_led_set_server_connected(false);
+
 //      esp_timer_stop(time_sync_data.timeSyncMessageTimer);
 
       received_codec_header = false;
@@ -1281,6 +1285,7 @@ static void http_get_task(void *pvParameters) {
     }
 
     ESP_LOGI(TAG, "netconn sent hello message");
+    status_led_set_server_connected(true);
 
     // init default setting
     scSet.buf_ms = 500;
@@ -1362,6 +1367,7 @@ static void dac_control_task(audio_board_handle_t board_handle,
                                AUDIO_HAL_CTRL_STOP);
         }
       }
+      status_led_set_playing(dac_data.enabled && !dac_data.mute);
       dac_data_old = dac_data;
     }
   }
@@ -1371,6 +1377,11 @@ static void dac_control_task(audio_board_handle_t board_handle,
  *
  */
 void app_main(void) {
+#if CONFIG_RESCUE_MODE_ENABLE
+  // OTA slots of a vendor partition table may lie above the flash size in
+  // our image header; let esp_flash reach the whole chip
+  web_rescue_unlock_physical_flash();
+#endif
   esp_err_t ret = nvs_flash_init();
   if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
       ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -1378,7 +1389,28 @@ void app_main(void) {
     ret = nvs_flash_init();
   }
 //  ESP_ERROR_CHECK(nvs_flash_erase());
+#if CONFIG_RESCUE_MODE_ENABLE
+  if (ret != ESP_OK) {
+    // without NVS there are no WiFi credentials: the setup AP still works
+    ESP_LOGE(TAG, "nvs_flash_init failed (%s): rescue mode",
+             esp_err_to_name(ret));
+    status_led_init();
+    status_led_set_rescue(true);
+    rescue_mode_run(false);
+  }
+#else
   ESP_ERROR_CHECK(ret);
+#endif
+
+#if CONFIG_RESCUE_MODE_ENABLE
+  // boards without a serial port: button at power-up, or a request from the
+  // previous run (no IP / long press), opens the setup access point instead
+  if (rescue_mode_requested()) {
+    status_led_init();
+    status_led_set_rescue(true);
+    rescue_mode_run(true);  // does not return
+  }
+#endif
 
   esp_log_level_set("*", ESP_LOG_INFO);
 
@@ -1424,6 +1456,10 @@ void app_main(void) {
 #endif
 
   network_if_init();
+  status_led_init();
+#if CONFIG_RESCUE_MODE_ENABLE
+  rescue_mode_arm();
+#endif
 
   board_i2s_pin_t pin_config0;
   get_i2s_pins(I2S_NUM_0, &pin_config0);
@@ -1480,7 +1516,13 @@ void app_main(void) {
     ESP_LOGE(TAG,
              "Audio board couldn't be initialized. Check menuconfig if project "
              "is configured right or check your wiring!");
-
+    status_led_set_error(true);
+#if CONFIG_RESCUE_MODE_ENABLE
+    // no OTA server yet: open the setup access point so a fixed firmware
+    // can be uploaded
+    vTaskDelay(pdMS_TO_TICKS(30000));
+    rescue_mode_request("audio board init failed");
+#endif
     vTaskDelay(portMAX_DELAY);
   }
 
@@ -1575,8 +1617,14 @@ void app_main(void) {
   dsp_settings_init();   // Then settings can restore params into the processor
 #endif
 
+#if !CONFIG_RESCUE_MODE_ENABLE
+  // upstream's raw port-8032 updater: unauthenticated, unchecked, and it
+  // kills the network task mid-connect (crashed mid-upload on hardware).
+  // Boards with the rescue page install through it instead (POST
+  // /api/rescue on the settings page, then /api/update).
   xTaskCreatePinnedToCore(&ota_server_task, "ota", 14 * 256, NULL,
                           OTA_TASK_PRIORITY, &t_ota_task, OTA_TASK_CORE_ID);
+#endif
 
   xTaskCreatePinnedToCore(&http_get_task, "http", 15 * 1024, NULL,
                           HTTP_TASK_PRIORITY, &t_http_get_task,

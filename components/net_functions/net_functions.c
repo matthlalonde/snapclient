@@ -28,8 +28,14 @@ void net_mdns_register(const char *clientname) {
   ESP_LOGI(TAG, "Setup mdns");
   ESP_ERROR_CHECK(mdns_init());
   ESP_ERROR_CHECK(mdns_hostname_set(clientname));
+#if CONFIG_RESCUE_MODE_ENABLE
+  // no port-8032 updater on these boards: announce the settings page
+  ESP_ERROR_CHECK(mdns_instance_name_set("ESP32 SNAPcast client"));
+  ESP_ERROR_CHECK(mdns_service_add(NULL, "_http", "_tcp", CONFIG_WEB_PORT, NULL, 0));
+#else
   ESP_ERROR_CHECK(mdns_instance_name_set("ESP32 SNAPcast client OTA"));
   ESP_ERROR_CHECK(mdns_service_add(NULL, "_http", "_tcp", 8032, NULL, 0));
+#endif
 }
 
 void mdns_print_results(const mdns_result_t *results) {

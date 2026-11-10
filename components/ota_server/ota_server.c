@@ -34,7 +34,12 @@ void ota_server_task(void *param) {
   // portMAX_DELAY);
 
   // TODO: find a good place to verify app is working properly after OTA
+#if !CONFIG_RESCUE_MODE_ENABLE
   esp_ota_mark_app_valid_cancel_rollback();
+#endif
+  // with rescue mode, the firmware is confirmed only after it has run 60 s
+  // with an IP address (web_rescue/rescue_mode.c), so a rollback-capable
+  // bootloader can still revert an image that crashes early
 
   ota_server_start_my();
   vTaskDelete(NULL);

@@ -10,12 +10,17 @@
 
 #include "ui_http_server.h"
 
+#include <ctype.h>
+#include <stdbool.h>
 #include <string.h>
 #include <stdio.h>
 
 #include "dsp_processor_settings.h"
 #include "esp_err.h"
 #include "esp_http_server.h"
+#if CONFIG_RESCUE_MODE_ENABLE
+#include "web_rescue.h"
+#endif
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
@@ -79,7 +84,7 @@ static const embedded_file_t embedded_files[] = {
  * Simple URL decode function
  * Decodes %XX hex sequences and + as space
  */
-static void url_decode(char *dst, const char *src, size_t dst_size) {
+static bool url_decode(char *dst, const char *src, size_t dst_size) {
 	size_t dst_idx = 0;
 	size_t src_idx = 0;
 
@@ -99,12 +104,31 @@ static void url_decode(char *dst, const char *src, size_t dst_size) {
 		}
 	}
 	dst[dst_idx] = '\0';
+	return src[src_idx] == '\0';  // false: dst was too small, value cut short
+}
+
+/* A snapserver host is a DNS name or an IP address: letters, digits, '.',
+ * '-' and ':' only. Anything else is refused, which also keeps markup out of
+ * the settings page that displays it. */
+static bool server_host_ok(const char *h) {
+	if (!h[0]) return false;
+	for (const char *c = h; *c; c++) {
+		if (!isalnum((unsigned char)*c) && *c != '.' && *c != '-' && *c != ':')
+			return false;
+	}
+	return true;
+}
+
+static esp_err_t send_400(httpd_req_t *req, const char *msg) {
+	httpd_resp_set_status(req, "400 Bad Request");
+	return httpd_resp_sendstr(req, msg);
 }
 
 /**
  * Find key value in parameter string
  */
-static int find_key_value(char *key, char *parameter, char *value) {
+static int find_key_value(char *key, char *parameter, char *value,
+						  size_t size) {
 	ESP_LOGD(TAG, "%s: key=%s", __func__, key);
 	// char * addr1;
 	char *addr1 = strstr(parameter, key);
@@ -117,15 +141,17 @@ static int find_key_value(char *key, char *parameter, char *value) {
 
 	char *addr3 = strstr(addr2, "&");
 	ESP_LOGD(TAG, "%s: addr3=%p", __func__, addr3);
-	if (addr3 == NULL) {
-		strcpy(value, addr2);
-	} else {
-		int length = addr3 - addr2;
-		ESP_LOGD(TAG, "%s: addr2=%p addr3=%p length=%d", __func__, addr2, addr3,
-				 length);
-		strncpy(value, addr2, length);
-		value[length] = 0;
+	size_t length = addr3 ? (size_t)(addr3 - addr2) : strlen(addr2);
+	// the query comes from the network: never write past the caller's buffer,
+	// and refuse (rather than truncate) a value that does not fit
+	if (size == 0 || length >= size) {
+		ESP_LOGW(TAG, "%s: value for %s too long (%u, max %u)", __func__, key,
+				 (unsigned)length, size ? (unsigned)size - 1 : 0);
+		if (size) value[0] = 0;
+		return 0;
 	}
+	memcpy(value, addr2, length);
+	value[length] = 0;
 	ESP_LOGD(TAG, "%s: key=[%s] value=[%s]", __func__, key, value);
 	return strlen(value);
 }
@@ -167,21 +193,42 @@ static esp_err_t root_post_handler(httpd_req_t *req) {
 	ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
 	URL_t urlBuf;
 	int ret = -1;
-	char param[16] = {0};
-	char valstr[64] = {0}; // Increased size for hostname
+	char param[32] = {0};
+	char valstr[160] = {0};  // a URL-encoded host name (128 decoded)
 
 	set_cors_headers(req);
 
 	memset(&urlBuf, 0, sizeof(URL_t));
 
-	if (find_key_value("param=", (char *)req->uri, param) &&
-		find_key_value("value=", (char *)req->uri, valstr)) {
+	// find_key_value refuses values that do not fit: answer that with 400
+	// instead of a silent 200 "ok", and tell it apart from an empty value
+	int plen = find_key_value("param=", (char *)req->uri, param, sizeof(param));
+	int vlen = find_key_value("value=", (char *)req->uri, valstr, sizeof(valstr));
+	const char *vkey = strstr(req->uri, "value=");
+	bool value_empty = vkey && (vkey[6] == '\0' || vkey[6] == '&');
+	if (!plen) return send_400(req, "missing or too long param");
+	if (vkey && !value_empty && !vlen) return send_400(req, "value too long");
+	// the settings page sends an empty host/port to clear them
+	if (value_empty && (strcmp(param, "snapserver_host") == 0 ||
+						strcmp(param, "snapserver_port") == 0)) {
+		esp_err_t e = param[11] == 'h' ? settings_set_server_host("")
+									   : settings_clear_server_port();
+		if (e != ESP_OK) {
+			httpd_resp_set_status(req, "500 Internal Server Error");
+			return httpd_resp_sendstr(req, "error");
+		}
+		httpd_resp_set_status(req, "200 OK");
+		return httpd_resp_sendstr(req, "ok");
+	}
+
+	if (vlen > 0) {
 
 		// Special handling for hostname (string parameter)
 		if (strcmp(param, "hostname") == 0) {
 			// URL decode the hostname value
 			char decoded_hostname[64] = {0};
-			url_decode(decoded_hostname, valstr, sizeof(decoded_hostname));
+			if (!url_decode(decoded_hostname, valstr, sizeof(decoded_hostname)))
+				return send_400(req, "hostname too long");
 
 			ESP_LOGI(TAG, "%s: Setting hostname to: %s", __func__,
 					 decoded_hostname);
@@ -199,7 +246,10 @@ static esp_err_t root_post_handler(httpd_req_t *req) {
 		// Special handling for snapserver host (string parameter)
 		if (strcmp(param, "snapserver_host") == 0) {
 			char decoded_host[128] = {0};
-			url_decode(decoded_host, valstr, sizeof(decoded_host));
+			if (!url_decode(decoded_host, valstr, sizeof(decoded_host)))
+				return send_400(req, "host too long");
+			if (!server_host_ok(decoded_host))
+				return send_400(req, "host: letters, digits, '.', '-', ':' only");
 			ESP_LOGI(TAG, "%s: Setting snapserver_host to: %s", __func__,
 					 decoded_host);
 			if (settings_set_server_host(decoded_host) == ESP_OK) {
@@ -281,7 +331,7 @@ static esp_err_t root_delete_handler(httpd_req_t *req) {
 
 	set_cors_headers(req);
 
-	if (!find_key_value("param=", (char *)req->uri, param)) {
+	if (!find_key_value("param=", (char *)req->uri, param, sizeof(param))) {
 		ESP_LOGD(TAG, "%s: Invalid delete: expected param=NAME in URI",
 				 __func__);
 		httpd_resp_set_status(req, "400 Bad Request");
@@ -356,11 +406,11 @@ static esp_err_t root_delete_handler(httpd_req_t *req) {
  */
 static esp_err_t get_param_handler(httpd_req_t *req) {
 	ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
-	char param[16] = {0};
+	char param[32] = {0};
 
 	set_cors_headers(req);
 
-	if (find_key_value("param=", (char *)req->uri, param)) {
+	if (find_key_value("param=", (char *)req->uri, param, sizeof(param))) {
 		// Special handling for hostname (string parameter)
 		if (strcmp(param, "hostname") == 0) {
 			char hostname[64] = {0};
@@ -516,7 +566,7 @@ static esp_err_t get_capabilities_handler(httpd_req_t *req) {
 
 	// Parse tab parameter
 	char tab[16] = {0};
-	if (!find_key_value("tab=", (char *)req->uri, tab)) {
+	if (!find_key_value("tab=", (char *)req->uri, tab, sizeof(tab))) {
 		// No tab specified, return error
 		ESP_LOGW(TAG, "%s: Missing 'tab' parameter", __func__);
 		httpd_resp_set_status(req, "400 Bad Request");
@@ -630,6 +680,30 @@ static esp_err_t restart_post_handler(httpd_req_t *req) {
 
 	return ESP_OK;
 }
+
+#if CONFIG_RESCUE_MODE_ENABLE
+/* POST /api/rescue: reboot into rescue mode, whose setup page installs
+ * firmware with image checks (the upstream port-8032 updater does none).
+ * Guarded like the rescue page: needs the X-Web-Rescue header and an IP or
+ * .local Host, and gets no CORS headers, so other web pages cannot trigger
+ * it from a browser. */
+static void rescue_task(void *pv) {
+	vTaskDelay(pdMS_TO_TICKS(300));  // let the response go out
+	rescue_mode_request("requested over the web UI");
+}
+
+static esp_err_t rescue_post_handler(httpd_req_t *req) {
+	if (!web_rescue_allow(req, true)) return ESP_OK;
+	ESP_LOGW(TAG, "rescue mode requested over the web UI, rebooting");
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_sendstr(req,
+					   "{\"ok\":true,\"msg\":\"rebooting into rescue mode\"}");
+	if (xTaskCreate(rescue_task, "rescue_req", 3072, NULL, 5, NULL) != pdPASS) {
+		ESP_LOGW(TAG, "%s: failed to create rescue task", __func__);
+	}
+	return ESP_OK;
+}
+#endif
 
 /*
  * GET /api/dac/settings handler
@@ -992,7 +1066,10 @@ esp_err_t start_server(const char *base_path, int port) {
 	ESP_LOGD(TAG, "%s: base_path=%s port=%d", __func__, base_path, port);
 	httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 	config.server_port = port;
-	config.max_open_sockets = 7;
+	// lwIP has 10 sockets (CONFIG_LWIP_MAX_SOCKETS): 3 go to this server's
+	// own use and 2 to the UDP logger, and the snapserver link plus a SYN
+	// must fit CONFIG_LWIP_MAX_ACTIVE_TCP=6; 4 sessions lets LRU purge work
+	config.max_open_sockets = 4;
 	config.max_uri_handlers = 64;
 	config.lru_purge_enable = true; // Enable LRU socket purging
 
@@ -1064,6 +1141,15 @@ esp_err_t start_server(const char *base_path, int port) {
 		.handler = restart_post_handler,
 	};
 	httpd_register_uri_handler(server, &_restart_post_handler);
+
+#if CONFIG_RESCUE_MODE_ENABLE
+	httpd_uri_t _rescue_post_handler = {
+		.uri = "/api/rescue",
+		.method = HTTP_POST,
+		.handler = rescue_post_handler,
+		.user_ctx = NULL};
+	httpd_register_uri_handler(server, &_rescue_post_handler);
+#endif
 
 	/* URI handler for OPTIONS (CORS preflight) - specific endpoints */
 	httpd_uri_t _options_post_handler = {

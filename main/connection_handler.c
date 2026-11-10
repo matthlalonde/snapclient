@@ -161,9 +161,21 @@ void setup_network(esp_netif_t** netif) {
       }
 
       if (ipaddr_aton(static_host, &remote_ip) == 0) {
-        ESP_LOGE(TAG, "can't convert static server address to numeric: %s",
-                 static_host);
-        continue;
+        // not a numeric address: a host name, looked up with the DNS server
+        // from DHCP
+#if LWIP_IPV4 && LWIP_IPV6
+        err_t derr = netconn_gethostbyname_addrtype(static_host, &remote_ip,
+                                                    NETCONN_DNS_IPV4_IPV6);
+#else
+        err_t derr = netconn_gethostbyname(static_host, &remote_ip);
+#endif
+        if (derr != ERR_OK) {
+          ESP_LOGE(TAG, "can't resolve snapserver host %s (err %d)",
+                   static_host, derr);
+          vTaskDelay(pdMS_TO_TICKS(2000));  // no tight retry loop
+          continue;
+        }
+        ESP_LOGI(TAG, "%s is %s", static_host, ipaddr_ntoa(&remote_ip));
       }
 
       remotePort = (uint16_t)static_port;

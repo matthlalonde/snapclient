@@ -353,8 +353,9 @@ esp_err_t settings_set_server_host(const char *host) {
     }
 
     if (host == NULL || host[0] == '\0') {
-        // erase
+        // erase (clearing a host that was never set is fine)
         err = nvs_erase_key(h, NVS_KEY_SERVER_HOST);
+        if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
         if (err == ESP_OK) err = nvs_commit(h);
     } else {
         err = nvs_set_str(h, NVS_KEY_SERVER_HOST, host);
