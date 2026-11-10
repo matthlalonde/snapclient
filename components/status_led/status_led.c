@@ -9,6 +9,8 @@
  *   green, bright    playing
  *   red, blinking    error
  *   cyan, blinking   rescue / setup access point
+ *   violet           Sendspin pairing window open
+ *   violet, blinking a Sendspin server waits for the pairing window
  *
  * The task sleeps until a state change (or the next blink edge), so it does
  * not keep the CPU out of automatic light sleep.
@@ -24,6 +26,7 @@ void status_led_set_server_connected(bool connected) {}
 void status_led_set_playing(bool playing) {}
 void status_led_set_error(bool error) {}
 void status_led_set_rescue(bool rescue) {}
+void status_led_set_pairing(uint8_t state) {}
 
 #else
 
@@ -52,6 +55,7 @@ static volatile bool s_server = false;
 static volatile bool s_playing = false;
 static volatile bool s_error = false;
 static volatile bool s_rescue = false;
+static volatile uint8_t s_pairing = 0;
 static TaskHandle_t s_task = NULL;
 
 /* ---------------------------------------------------------------- */
@@ -174,6 +178,8 @@ typedef struct {
 static pattern_t current_pattern(void) {
   if (s_error) return (pattern_t){255, 0, 0, true};
   if (s_rescue) return (pattern_t){0, 255, 255, true};
+  if (s_pairing == 2) return (pattern_t){150, 0, 255, true};
+  if (s_pairing == 1) return (pattern_t){150, 0, 255, false};
   if (s_booting) return (pattern_t){160, 160, 160, false};
   if (!s_wifi_up && !s_eth_up) {
     if (s_need_provisioning) return (pattern_t){255, 0, 255, true};
@@ -291,6 +297,11 @@ void status_led_set_error(bool error) {
 
 void status_led_set_rescue(bool rescue) {
   s_rescue = rescue;
+  kick();
+}
+
+void status_led_set_pairing(uint8_t state) {
+  s_pairing = state;
   kick();
 }
 

@@ -30,6 +30,16 @@ menu "Sendspin player"
             With this on, any Sendspin server on the network may play on this
             device without pairing first; Music Assistant then adds it with
             no setup step (the same default ESPHome uses). Turn it off to
-            accept only paired servers.
+            accept only paired servers ("require pairing").
+
+            The Status tab of the settings page can change this at run time
+            (kept across restarts); this sets the starting value.
+
+            A server pairs with the 8-digit code shown on the Status tab,
+            while the pairing window is open: a short press of the device
+            button or "Allow pairing" on the Status tab opens it for 5
+            minutes. Pair Music Assistant first, then require pairing:
+            Music Assistant does not reconnect by itself after an unpaired
+            connection is refused.
 
 endmenu

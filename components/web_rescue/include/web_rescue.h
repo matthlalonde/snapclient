@@ -52,9 +52,10 @@ void web_rescue_touch(void);
 
 // Request gate for every handler (built-in ones use it too). Rejects with
 // 403 and returns false when
-//   - the Host header is not an IP literal or a *.local name (blocks DNS
-//     rebinding: a hostile web page cannot make the browser talk to us
-//     under its own domain), or
+//   - the Host header is not an IP literal, a single-label name or a name
+//     under .local, .lan, .home, .home.arpa, .internal or .localdomain
+//     (blocks DNS rebinding: a hostile web page cannot make the browser talk
+//     to us under its own domain), or
 //   - `sensitive` and the request lacks the "X-Web-Rescue: 1" header. A
 //     cross-site page cannot add a custom header without a CORS preflight,
 //     which this server never answers, so forms/fetches from other sites
@@ -62,6 +63,11 @@ void web_rescue_touch(void);
 //     pins or returns secrets (the flash backup holds WiFi passwords).
 // On success it also calls web_rescue_touch().
 bool web_rescue_allow(httpd_req_t *req, bool sensitive);
+
+// The Host check alone (403 on failure), touching nothing: for normal
+// operation's pages. (web_rescue_touch() would confirm newly installed
+// firmware on the first request, before rescue_mode's 60 s with an IP.)
+bool web_rescue_host_allowed(httpd_req_t *req);
 #define WEB_RESCUE_HEADER "X-Web-Rescue"
 
 // true while a firmware upload is being written
@@ -96,6 +102,11 @@ void rescue_mode_request(const char *why) __attribute__((noreturn));
 // away; `problem`: something went wrong. The default does nothing. It can run
 // on the 2 KB esp_timer task: an override must not printf.
 void web_rescue_note(bool restart, bool problem, const char *text);
+
+// Normal operation: the button was pressed briefly (released within 2 s; a
+// 5 s hold opens rescue mode). The default does nothing. Runs on the button
+// task's 3 KB stack: an override must return quickly and not printf.
+void web_rescue_button_pressed(void);
 
 // Normal operation: watch the button (5 s hold -> rescue) and start the
 // "no IP within CONFIG_RESCUE_NO_IP_TIMEOUT_S -> rescue" timer. Call after

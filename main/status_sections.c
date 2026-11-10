@@ -1,7 +1,7 @@
 // The settings page's Status tab (GET /api/status, see ui_http_server.h):
 //   output    which source owns the I2S output (AUX and optical) and its format
 //   snapcast  server connection, stream, sync health
-//   sendspin  server, group, stream, volume
+//   sendspin  server, group, stream, volume, pairing
 //   device    firmware, uptime, last reset, WiFi, memory, stack headroom
 //   events    a change counter for the event log (GET /api/events)
 // It also records the start-up and WiFi events in the event log.
@@ -277,6 +277,65 @@ static void sendspin_section(cJSON *o) {
     }
   }
   free(np);
+
+  // pairing: ~900 bytes, so on the heap too
+  sendspin_pairing_t *pr = malloc(sizeof(*pr));
+  if (pr != NULL && sendspin_player_get_pairing(pr)) {
+    cJSON *p = cJSON_AddObjectToObject(o, "pairing");
+    if (p != NULL) {
+      cJSON_AddStringToObject(p, "code", pr->code);
+      cJSON_AddBoolToObject(p, "required", pr->require_pairing);
+      cJSON_AddStringToObject(p, "required_from",
+                              pr->require_from_page ? "page" : "build");
+      cJSON_AddBoolToObject(p, "window_open", pr->window_open);
+      if (pr->window_open) {
+        cJSON_AddNumberToObject(p, "window_left_s", pr->window_left_s);
+        if (pr->window_for[0]) {
+          cJSON_AddStringToObject(p, "window_for", pr->window_for);
+        }
+      }
+      cJSON_AddBoolToObject(p, "waiting", pr->waiting);
+      cJSON_AddBoolToObject(p, "pairing_now", pr->pairing_now);
+      if (pr->waiting || pr->pairing_now) {
+        cJSON_AddStringToObject(p, "server", pr->server);
+      }
+      cJSON *list = cJSON_AddArrayToObject(p, "paired");
+      for (uint8_t i = 0; list != NULL && i < pr->paired_count; i++) {
+        cJSON *e = cJSON_CreateObject();
+        if (e == NULL) break;
+        cJSON_AddStringToObject(e, "id", pr->paired[i].id);
+        if (pr->paired[i].name[0]) {
+          cJSON_AddStringToObject(e, "name", pr->paired[i].name);
+        }
+        cJSON_AddBoolToObject(e, "connected", pr->paired[i].connected);
+        cJSON_AddItemToArray(list, e);
+      }
+    }
+  }
+  free(pr);
+}
+
+// Status tab buttons: the Sendspin task carries them out within ~20 ms
+static bool pair_allow_action(void) {
+  return sendspin_player_command(SENDSPIN_CMD_ALLOW_PAIRING_PAGE);
+}
+static bool pair_stop_action(void) {
+  return sendspin_player_command(SENDSPIN_CMD_STOP_PAIRING);
+}
+static bool require_on_action(void) {
+  return sendspin_player_command(SENDSPIN_CMD_REQUIRE_PAIRING);
+}
+static bool require_off_action(void) {
+  return sendspin_player_command(SENDSPIN_CMD_ALLOW_UNPAIRED);
+}
+static bool forget_action(void) {
+  return sendspin_player_command(SENDSPIN_CMD_FORGET_PAIRED);
+}
+
+// web_rescue's hook (a weak no-op there): a short press of the button opens
+// the Sendspin pairing window. Runs on the button task: just queue it.
+void web_rescue_button_pressed(void) {
+  sendspin_player_command(SENDSPIN_CMD_ALLOW_PAIRING_BUTTON);
 }
 #endif
 
@@ -509,6 +568,11 @@ void status_sections_init(const char *name) {
   ui_http_add_status_section("snapcast", snapcast_section);
 #if CONFIG_SENDSPIN_PLAYER_ENABLE
   ui_http_add_status_section("sendspin", sendspin_section);
+  ui_http_add_action("sendspin-pair-allow", pair_allow_action);
+  ui_http_add_action("sendspin-pair-stop", pair_stop_action);
+  ui_http_add_action("sendspin-require-pairing", require_on_action);
+  ui_http_add_action("sendspin-allow-unpaired", require_off_action);
+  ui_http_add_action("sendspin-forget-paired", forget_action);
 #endif
   ui_http_add_status_section("device", device_section);
   ui_http_add_status_section("wifi", wifi_section);

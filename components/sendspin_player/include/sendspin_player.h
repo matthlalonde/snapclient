@@ -70,6 +70,60 @@ typedef struct {
  */
 bool sendspin_player_get_now_playing(sendspin_now_playing_t *out);
 
+/*
+ * Pairing. A paired server holds a key this device stored when the two
+ * paired; with "require pairing" on, only paired servers may play.
+ *
+ * A server pairs with the static 8-digit code shown on the Status tab, and
+ * only while the pairing window is open: a short press of the device button
+ * or the Status tab's "Allow pairing" opens it for 5 minutes (one server
+ * connection may pair under it).
+ */
+#define SENDSPIN_MAX_PAIRED 12
+
+typedef struct {
+  char id[12];    // start of the server's public key (base64url)
+  char name[48];  // last name seen while it was connected, "" if unknown
+  bool connected;
+} sendspin_paired_server_t;
+
+typedef struct {
+  char code[9];              // the static pairing code, "" if none
+  bool require_pairing;      // unpaired servers are refused
+  bool require_from_page;    // set on the Status tab (else the build setting)
+  bool window_open;          // a server may pair now
+  uint16_t window_left_s;    // about how long it stays open
+  char window_for[48];       // reserved for this server's connection ("" = any)
+  bool waiting;              // a server waits for the window to open
+  bool pairing_now;          // a server is pairing: type the code in it
+  char server[48];           // the server waiting or pairing (its name, or
+                             // the start of its key)
+  uint8_t paired_count;
+  sendspin_paired_server_t paired[SENDSPIN_MAX_PAIRED];
+} sendspin_pairing_t;
+
+/**
+ * Copy the pairing state. Returns false when the player is not built in or
+ * not started. Any task; never blocks. ~900 bytes: use a heap buffer.
+ */
+bool sendspin_player_get_pairing(sendspin_pairing_t *out);
+
+typedef enum {
+  SENDSPIN_CMD_ALLOW_PAIRING_BUTTON,  // the device button: open the window
+  SENDSPIN_CMD_ALLOW_PAIRING_PAGE,    // the Status tab: open the window
+  SENDSPIN_CMD_STOP_PAIRING,          // close the window
+  SENDSPIN_CMD_REQUIRE_PAIRING,       // refuse unpaired servers (saved)
+  SENDSPIN_CMD_ALLOW_UNPAIRED,        // let unpaired servers play (saved)
+  SENDSPIN_CMD_FORGET_PAIRED,         // delete every pairing, then restart
+} sendspin_cmd_t;
+
+/**
+ * Hand a command to the Sendspin task, which carries it out within ~20 ms.
+ * Any task (small stacks too); never blocks. False when the player is not
+ * running or a few commands are already waiting.
+ */
+bool sendspin_player_command(sendspin_cmd_t cmd);
+
 /**
  * Start the Sendspin player (Music Assistant's synchronized audio protocol)
  * under the given display name. It listens for servers on

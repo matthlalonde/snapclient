@@ -85,8 +85,14 @@ void web_rescue_touch(void) {
   }
 }
 
+// Names no public DNS hands out, so a hostile site can't point one at this
+// board (DNS rebinding): IP addresses, single-label names (resolved on the
+// LAN only), and names under suffixes reserved or used for home networks.
 static bool host_ok(httpd_req_t *req) {
-  char host[80] = "";  // 63-char name + ".local" + ":65535"
+  static const char *const local_suffixes[] = {
+      ".local", ".lan", ".home", ".home.arpa", ".internal", ".localdomain",
+  };
+  char host[96] = "";  // a 63-char name, a router's domain and ":65535"
   size_t n = httpd_req_get_hdr_value_len(req, "Host");
   if (n == 0) return true;  // non-browser client
   if (n >= sizeof(host) ||
@@ -96,18 +102,31 @@ static bool host_ok(httpd_req_t *req) {
   char *colon = strrchr(host, ':');
   if (colon) *colon = 0;  // drop the port
   size_t len = strlen(host);
-  bool ip = len > 0;
+  if (len > 1 && host[len - 1] == '.') host[--len] = 0;  // "name.local."
+  if (len == 0) return false;
+  bool ip = true;
   for (size_t i = 0; i < len; i++) {
     if (!isdigit((unsigned char)host[i]) && host[i] != '.') ip = false;
   }
-  if (ip) return true;
-  return len > 6 && strcasecmp(host + len - 6, ".local") == 0;
+  if (ip || strchr(host, '.') == NULL) return true;
+  for (size_t i = 0; i < sizeof(local_suffixes) / sizeof(local_suffixes[0]); i++) {
+    size_t k = strlen(local_suffixes[i]);
+    if (len > k && strcasecmp(host + len - k, local_suffixes[i]) == 0) return true;
+  }
+  return false;
+}
+
+bool web_rescue_host_allowed(httpd_req_t *req) {
+  if (!host_ok(req)) {
+    httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
+                        "use the board's IP address or its local name");
+    return false;
+  }
+  return true;
 }
 
 bool web_rescue_allow(httpd_req_t *req, bool sensitive) {
-  if (!host_ok(req)) {
-    httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
-                        "use the board's IP address or name.local");
+  if (!web_rescue_host_allowed(req)) {
     return false;
   }
   if (sensitive) {
@@ -138,6 +157,9 @@ __attribute__((weak)) void web_rescue_note(bool restart, bool problem,
   (void)problem;
   (void)text;
 }
+
+// web_rescue_button_pressed default: does nothing
+__attribute__((weak)) void web_rescue_button_pressed(void) {}
 
 static void reboot_cb(void *arg) { esp_restart(); }
 

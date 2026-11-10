@@ -41,6 +41,9 @@ static const char *TAG = "rescue";
 
 #define RESCUE_MAGIC 0x5245534Bu  // "RESK"
 #define HOLD_TO_RESCUE_MS 5000
+#define BUTTON_SAMPLE_MS 50
+#define SHORT_PRESS_MIN_MS 100   // two samples: not a glitch
+#define SHORT_PRESS_MAX_MS 2000  // a longer press is on its way to rescue
 
 #define CRASH_MAGIC 0x43524153u  // "CRAS"
 #define CRASHES_TO_RESCUE 3         // consecutive abnormal resets
@@ -223,9 +226,17 @@ static void on_net(void *arg, esp_event_base_t base, int32_t id, void *data) {
 static void button_task(void *arg) {
   int held_ms = 0;
   while (1) {
-    vTaskDelay(pdMS_TO_TICKS(100));
-    held_ms = button_pressed() ? held_ms + 100 : 0;
-    if (held_ms >= HOLD_TO_RESCUE_MS) rescue_mode_request("Rescue mode: button held");
+    vTaskDelay(pdMS_TO_TICKS(BUTTON_SAMPLE_MS));
+    if (button_pressed()) {
+      held_ms += BUTTON_SAMPLE_MS;
+      if (held_ms >= HOLD_TO_RESCUE_MS) rescue_mode_request("Rescue mode: button held");
+      continue;
+    }
+    // released: a short press is for the application (Sendspin pairing)
+    if (held_ms >= SHORT_PRESS_MIN_MS && held_ms <= SHORT_PRESS_MAX_MS) {
+      web_rescue_button_pressed();
+    }
+    held_ms = 0;
   }
 }
 #endif

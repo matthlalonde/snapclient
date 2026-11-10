@@ -7,6 +7,8 @@
 //     (player_release_output) and gets back 2 s after the stream ends
 //   - NVS for the device identity (X25519 key) and pairing records
 //   - mDNS (_sendspin._tcp) so Music Assistant finds the player
+//   - pairing: a static code, a pairing window opened by the device button or
+//     the Status tab, and the "require pairing" setting
 //
 // Sync rests on exact playback reports. Every DMA buffer is written whole as
 // [real audio][silence padding], and a lockstep queue records how many real
@@ -38,6 +40,8 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_pm.h"
+#include "esp_random.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -50,6 +54,8 @@
 #include "nvs.h"
 #include "player.h"
 #include "sendspin/client.h"
+#include "sendspin/persistence_codec.h"
+#include "sendspin/persistence_keys.h"
 #include "sendspin/player_role.h"
 #if CONFIG_SENDSPIN_ENABLE_METADATA
 #include "sendspin/metadata_role.h"
@@ -58,6 +64,7 @@
 extern "C" {
 #include "event_log.h"
 #include "network_interface.h"
+#include "status_led.h"
 // main.c: DAC enable / mute through the board HAL; also drives the status LED
 void audio_set_mute(bool mute);
 void audio_dac_enable(bool enabled);
@@ -111,9 +118,52 @@ portMUX_TYPE g_status_mux = portMUX_INITIALIZER_UNLOCKED;
 // what is playing: written by the loop task (metadata listener, progress)
 sendspin_now_playing_t g_np = {};
 portMUX_TYPE g_np_mux = portMUX_INITIALIZER_UNLOCKED;
+// pairing state for the Status tab: written by the loop task
+sendspin_pairing_t g_pair = {};
+portMUX_TYPE g_pair_mux = portMUX_INITIALIZER_UNLOCKED;
+// commands from other tasks (web server, button) for the loop task
+QueueHandle_t g_cmds = nullptr;
+std::atomic<bool> g_started{false};
+
+// "Let servers play without pairing" from the build; the Status tab can
+// change it (saved in NVS only while it differs from this)
+#if CONFIG_SENDSPIN_UNPAIRED_ACCESS
+constexpr bool kUnpairedDefault = true;
+#else
+constexpr bool kUnpairedDefault = false;
+#endif
+constexpr const char *kUnpairedKey = "unpaired";
+constexpr const char *kCodeKey = "pair_code";
+constexpr const char *kNamesKey = "srv_names";
+// the library's pairing window: 5 minutes, closed by five wrong codes
+constexpr int64_t kWindowUs = 300LL * 1000 * 1000;
+constexpr uint8_t kWindowFailLimit = 5;
+// the library ends an attempt after 120 s; a little more, in case a server
+// drops one without either callback
+constexpr int64_t kAttemptUs = 125LL * 1000 * 1000;
+// a server may also drop its pairing (server/unpair): re-read now and then
+constexpr int64_t kRecordsRefreshUs = 60LL * 1000 * 1000;
+constexpr size_t kMaxRecords =
+    sendspin::SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS;
+static_assert(kMaxRecords == SENDSPIN_MAX_PAIRED,
+              "the Status tab lists every pairing record");
 
 void copy_str(char *dst, size_t size, const std::string &src) {
   size_t n = std::min(src.size(), size - 1);
+  std::memcpy(dst, src.data(), n);
+  dst[n] = '\0';
+}
+
+// at most size-1 bytes, never splitting a UTF-8 character
+void copy_utf8(char *dst, size_t size, const std::string &src) {
+  size_t n = std::min(src.size(), size - 1);
+  if (n < src.size()) {
+    // src[n] is the first byte left out: if it continues a character, that
+    // character started earlier; cut before it
+    while (n > 0 && (static_cast<unsigned char>(src[n]) & 0xC0) == 0x80) {
+      n--;
+    }
+  }
   std::memcpy(dst, src.data(), n);
   dst[n] = '\0';
 }
@@ -129,6 +179,74 @@ const char *codec_name(sendspin::SendspinCodecFormat codec) {
     default:
       return "unsupported";
   }
+}
+
+// Our own settings, namespace "ss_app".
+std::optional<uint8_t> app_load_u8(const char *key) {
+  nvs_handle_t h;
+  uint8_t v = 0;
+  if (nvs_open(kAppNamespace, NVS_READONLY, &h) != ESP_OK) {
+    return std::nullopt;
+  }
+  esp_err_t err = nvs_get_u8(h, key, &v);
+  nvs_close(h);
+  return err == ESP_OK ? std::optional<uint8_t>(v) : std::nullopt;
+}
+
+void app_save_u8(const char *key, uint8_t v) {
+  nvs_handle_t h;
+  if (nvs_open(kAppNamespace, NVS_READWRITE, &h) == ESP_OK) {
+    nvs_set_u8(h, key, v);  // NVS skips the write when nothing changed
+    nvs_commit(h);
+    nvs_close(h);
+  }
+}
+
+void app_erase(const char *key) {
+  nvs_handle_t h;
+  if (nvs_open(kAppNamespace, NVS_READWRITE, &h) == ESP_OK) {
+    if (nvs_erase_key(h, key) == ESP_OK) {
+      nvs_commit(h);
+    }
+    nvs_close(h);
+  }
+}
+
+bool is_pairing_code(const char *s) {
+  size_t n = 0;
+  for (; s[n] != '\0'; n++) {
+    if (s[n] < '0' || s[n] > '9') {
+      return false;
+    }
+  }
+  return n == 8;
+}
+
+// The static pairing code: 8 digits drawn once per device from the hardware
+// RNG (a CSPRNG while the radio runs, as the Sendspin spec asks), then kept.
+std::string load_or_make_pairing_code() {
+  char code[16] = "";
+  size_t len = sizeof(code);
+  nvs_handle_t h;
+  const bool nvs = nvs_open(kAppNamespace, NVS_READWRITE, &h) == ESP_OK;
+  if (nvs && nvs_get_str(h, kCodeKey, code, &len) == ESP_OK &&
+      is_pairing_code(code)) {
+    nvs_close(h);
+    return code;
+  }
+  uint32_t v;
+  do {
+    v = esp_random();
+  } while (v >= 4000000000u);  // 40 x 10^8: every code equally likely
+  std::snprintf(code, sizeof(code), "%08lu",
+                static_cast<unsigned long>(v % 100000000u));
+  if (!nvs || nvs_set_str(h, kCodeKey, code) != ESP_OK || nvs_commit(h) != ESP_OK) {
+    ESP_LOGE(TAG, "could not save the pairing code: it changes at every start");
+  }
+  if (nvs) {
+    nvs_close(h);
+  }
+  return code;
 }
 
 int32_t volume_to_gain_q15(uint8_t volume, bool muted) {
@@ -483,6 +601,15 @@ class NvsStore : public sendspin::SendspinPersistenceProvider {
 
   bool commit() override { return ok_ && nvs_commit(h_) == ESP_OK; }
 
+  // forget_paired() only, right before a restart
+  bool erase(const std::string &key) {
+    if (!ok_) {
+      return false;
+    }
+    esp_err_t err = nvs_erase_key(h_, key.c_str());
+    return err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND;
+  }
+
  private:
   nvs_handle_t h_ = 0;
   bool ok_ = false;
@@ -496,14 +623,441 @@ class Network : public sendspin::SendspinNetworkProvider {
   }
 };
 
+const char *abort_text(sendspin::SendspinPairAbortReason reason) {
+  using R = sendspin::SendspinPairAbortReason;
+  switch (reason) {
+    case R::ATTEMPT_TIMEOUT:
+      return "timed out";
+    case R::CONCURRENT_ATTEMPT:
+      return "another pairing under way";
+    case R::METHOD_NOT_SUPPORTED:
+      return "unsupported method";
+    case R::PAIRING_CODE_MISMATCH:
+      return "wrong code";
+    case R::USER_CANCELLED:
+      return "cancelled";
+    default:
+      return "protocol error";
+  }
+}
+
+// Pairing state for the Status tab and the LED, and the commands that change
+// it. Loop task only; the library calls its listeners there too.
+//
+// The library keeps its pairing window to itself, so the window here follows
+// its rules from what can be seen (pairing.md "Pairing Window"):
+//   - a gesture (button or Status tab) opens it for 5 minutes; with a server
+//     waiting, that server's attempt starts at once;
+//   - the first attempt under it binds it to that server's connection;
+//   - it closes when a pairing under it succeeds, after five wrong codes, on
+//     Stop, at expiry, and when its connection is lost.
+// The library admits one server at a time, and get_server_information()
+// names it (nothing while none is admitted): when that is no longer the
+// window's or the attempt's server, its connection is gone. Some ends of an
+// attempt fire no callback (a dropped connection with no prompt shown, or a
+// server leaving pairing with a plain activate), so those checks and a
+// trust report end it too. Missed: the same server reconnecting within one
+// 20 ms loop.
+// A gesture during an attempt would reopen the window unbound (open to any
+// connection, and left open by the success), so it is ignored; a success
+// also cancels any window still open.
+class Pairing {
+ public:
+  void init(sendspin::SendspinClient *client, NvsStore *store, std::string code,
+            bool from_page) {
+    client_ = client;
+    store_ = store;
+    code_ = std::move(code);
+    from_page_ = from_page;
+    load_names();
+  }
+
+  // ---- library callbacks, forwarded by Player ----
+
+  void on_started(const std::string &server_id) {
+    attempt_id_ = server_id;
+    // bounded by the library's 120 s attempt timeout (which reports a
+    // failure); a server may also drop an attempt without either callback
+    attempt_until_us_ = esp_timer_get_time() + kAttemptUs;
+    if (window_until_us_ != 0 && window_for_.empty()) {
+      window_for_ = server_id;  // an open window admits it and binds to it
+    }
+    ESP_LOGI(TAG, "pairing started by server %s", server_id.c_str());
+  }
+
+  // the attempt waits for the pairing-window gesture
+  void on_open_window() {
+    prompt_ = true;
+    gesture_ = false;
+    // event texts end at 95 characters, and a server name can take 45
+    event_log_addf(EVENT_SRC_SENDSPIN, EVENT_INFO,
+                   "%s asks to pair: press the button or Allow pairing",
+                   display_name(attempt_id_).c_str());
+  }
+
+  // after every attempt that opened the prompt, whatever its outcome
+  void on_close_window() {
+    prompt_ = false;
+    gesture_ = false;
+    attempt_until_us_ = 0;
+  }
+
+  void on_succeeded(const std::string &server_id) {
+    // the library closes the window this attempt ran under; close any other
+    // one too, so nothing stays open that the page doesn't show
+    client_->cancel_pairing_window();
+    window_until_us_ = 0;
+    window_for_.clear();
+    attempt_until_us_ = 0;
+    refresh_records();  // written before this callback
+    learn_name(server_id);
+    event_log_addf(EVENT_SRC_SENDSPIN, EVENT_INFO, "Paired with %s",
+                   display_name(server_id).c_str());
+  }
+
+  void on_failed(const std::string &server_id,
+                 sendspin::SendspinPairAbortReason reason) {
+    using R = sendspin::SendspinPairAbortReason;
+    if (server_id == attempt_id_) {
+      attempt_until_us_ = 0;
+    }
+    if (window_until_us_ != 0) {
+      if (reason == R::PAIRING_CODE_MISMATCH && ++window_failures_ >= kWindowFailLimit) {
+        close_window_state();  // five wrong codes
+      } else if ((reason == R::UNKNOWN || reason == R::CONCURRENT_ATTEMPT) &&
+                 server_id == window_for_) {
+        close_window_state();  // the library closed that connection
+      }
+    }
+    event_log_addf(EVENT_SRC_SENDSPIN, EVENT_WARN, "Pairing with %s failed: %s",
+                   display_name(server_id).c_str(), abort_text(reason));
+  }
+
+  // a connection reported its trust: keep a paired server's name for the list
+  // (always after a handshake, which ends any attempt on that connection; a
+  // new attempt on it reports on_started after this)
+  void on_trust(bool paired) {
+    if (!prompt_) {
+      attempt_until_us_ = 0;
+    }
+    auto info = client_->get_server_information();
+    if (paired && info) {
+      learn_name(info->server_id);
+    }
+  }
+
+  // ---- commands ----
+
+  void open_window(const char *how) {
+    if (pairing_now()) {
+      event_log_addf(EVENT_SRC_SENDSPIN, EVENT_INFO,
+                     "Pairing with %s is under way: type the code in it",
+                     display_name(attempt_id_).c_str());
+      return;
+    }
+    client_->confirm_pairing_window();
+    window_until_us_ = esp_timer_get_time() + kWindowUs;
+    window_failures_ = 0;
+    window_for_.clear();
+    if (waiting()) {
+      gesture_ = true;              // the waiting attempt starts now...
+      window_for_ = attempt_id_;    // ...and the window binds to it
+      attempt_until_us_ = esp_timer_get_time() + kAttemptUs;
+      event_log_addf(EVENT_SRC_SENDSPIN, EVENT_INFO,
+                     "Pairing allowed (%s): type the code in %s", how,
+                     display_name(attempt_id_).c_str());
+    } else {
+      event_log_addf(EVENT_SRC_SENDSPIN, EVENT_INFO,
+                     "Pairing allowed for 5 minutes (%s)", how);
+    }
+  }
+
+  // Stop: closes the window, and refuses a server still waiting for it. An
+  // attempt already under way runs to its end (the library's rule), but a
+  // retry after a wrong code then needs a new gesture.
+  void close_window() {
+    client_->cancel_pairing_window();
+    if (pairing_now()) {
+      event_log_addf(EVENT_SRC_SENDSPIN, EVENT_INFO,
+                     "Pairing window closed; %s may still finish pairing",
+                     display_name(attempt_id_).c_str());
+    } else if (window_until_us_ != 0 || waiting()) {
+      event_log_add(EVENT_SRC_SENDSPIN, EVENT_INFO,
+                    waiting() ? "Pairing refused (Status tab)"
+                              : "Pairing window closed (Status tab)");
+    }
+    close_window_state();
+  }
+
+  void set_require(bool require) {
+    const bool unpaired = !require;
+    const bool changed = client_->is_unpaired_access_enabled() != unpaired;
+    // turning it off closes the connections of unpaired servers
+    client_->set_unpaired_access_enabled(unpaired);
+    // saved only while it differs from the build setting, so the build
+    // setting applies again once the two agree
+    from_page_ = unpaired != kUnpairedDefault;
+    if (from_page_) {
+      app_save_u8(kUnpairedKey, unpaired ? 1 : 0);
+    } else {
+      app_erase(kUnpairedKey);
+    }
+    if (changed) {
+      event_log_add(EVENT_SRC_SENDSPIN, EVENT_INFO,
+                    require ? "Pairing required: unpaired servers are refused "
+                              "(Status tab)"
+                            : "Unpaired servers may play (Status tab)");
+    }
+  }
+
+  size_t paired_count() const { return records_.size(); }
+
+  // Read the record slots the library stored (the same thread uses them).
+  void refresh_records() {
+    records_.clear();
+    for (size_t n = 0; n < kMaxRecords; n++) {
+      auto blob = store_->load_blob(sendspin::persistence_keys::record_slot_key(n));
+      if (!blob) {
+        continue;
+      }
+      // a free slot is all zeros, which decodes to nothing
+      auto rec = sendspin::decode_pairing_record(blob->data(), blob->size());
+      if (rec) {
+        records_.push_back(rec->server_id);
+      }
+    }
+    next_refresh_us_ = esp_timer_get_time() + kRecordsRefreshUs;
+  }
+
+  // Every loop: expiries, the LED, deferred saves, the snapshot.
+  void poll(bool output_open) {
+    const int64_t now = esp_timer_get_time();
+    if (window_until_us_ != 0 && now >= window_until_us_) {
+      close_window_state();
+    }
+    if (attempt_until_us_ != 0 && now >= attempt_until_us_) {
+      attempt_until_us_ = 0;
+    }
+    // the one admitted server: has the window's or the attempt's gone?
+    if ((window_until_us_ != 0 && !window_for_.empty()) ||
+        (attempt_until_us_ != 0 && !waiting())) {
+      auto info = client_->get_server_information();
+      if (!window_for_.empty() && (!info || info->server_id != window_for_)) {
+        close_window_state();  // the library closed it with the connection
+      }
+      if (attempt_until_us_ != 0 && !waiting() &&
+          (!info || info->server_id != attempt_id_)) {
+        attempt_until_us_ = 0;
+      }
+    }
+    // blinking: press the button; steady: pairing is allowed or under way
+    const uint8_t led = waiting() ? 2 : (window_until_us_ != 0 || pairing_now()) ? 1 : 0;
+    if (led != led_) {
+      led_ = led;
+      status_led_set_pairing(led);
+    }
+    if (now >= next_refresh_us_) {
+      refresh_records();
+    }
+    // a flash write during playback can stall the output task
+    if (names_dirty_ && !output_open) {
+      names_dirty_ = false;
+      save_names();
+    }
+    if (now < next_publish_us_) {
+      return;
+    }
+    next_publish_us_ = now + kStatusPeriodUs;
+
+    sendspin_pairing_t &p = scratch_;  // ~900 bytes: not on the stack
+    p = {};
+    copy_str(p.code, sizeof(p.code), code_);
+    p.require_pairing = !client_->is_unpaired_access_enabled();
+    p.require_from_page = from_page_;
+    p.window_open = window_until_us_ != 0;
+    if (p.window_open) {
+      p.window_left_s = static_cast<uint16_t>((window_until_us_ - now + 999999) / 1000000);
+      if (!window_for_.empty()) {
+        copy_utf8(p.window_for, sizeof(p.window_for), display_name(window_for_));
+      }
+    }
+    p.waiting = waiting();
+    p.pairing_now = pairing_now();
+    if (p.waiting || p.pairing_now) {
+      copy_utf8(p.server, sizeof(p.server), display_name(attempt_id_));
+    }
+    auto info = client_->is_connected() ? client_->get_server_information()
+                                        : std::nullopt;
+    const size_t count = std::min(records_.size(), size_t{SENDSPIN_MAX_PAIRED});
+    for (size_t i = 0; i < count; i++) {
+      const std::string &id = records_[i];
+      sendspin_paired_server_t &e = p.paired[i];
+      // snprintf: GCC misreads a copy helper inlined in this loop as overflowing
+      std::snprintf(e.id, sizeof(e.id), "%s", id.c_str());
+      const Name *n = find_name(id);
+      if (n != nullptr) {
+        std::snprintf(e.name, sizeof(e.name), "%s", n->name);
+      }
+      e.connected = info && info->server_id == id;
+    }
+    p.paired_count = static_cast<uint8_t>(count);
+    taskENTER_CRITICAL(&g_pair_mux);
+    g_pair = p;
+    taskEXIT_CRITICAL(&g_pair_mux);
+  }
+
+ private:
+  // Server names for the list: a record holds only the server's key.
+  struct Name {
+    char id[17];  // the key's first 16 characters
+    char name[47];
+  };
+
+  static bool same_id(const Name &n, const std::string &id) {
+    return n.id[0] != '\0' && id.compare(0, sizeof(n.id) - 1, n.id) == 0;
+  }
+
+  const Name *find_name(const std::string &id) const {
+    for (const auto &n : names_) {
+      if (same_id(n, id)) {
+        return &n;
+      }
+    }
+    return nullptr;
+  }
+
+  bool is_paired(const std::string &id) const {
+    return std::find(records_.begin(), records_.end(), id) != records_.end();
+  }
+
+  // Remember the connected server's name if it is this paired server.
+  void learn_name(const std::string &id) {
+    auto info = client_->get_server_information();
+    if (!info || info->server_id != id || info->name.empty() || !is_paired(id)) {
+      return;
+    }
+    Name *slot = nullptr;
+    for (auto &n : names_) {
+      if (same_id(n, id)) {
+        slot = &n;
+        break;
+      }
+    }
+    if (slot == nullptr) {
+      // a free entry, or one whose server is no longer paired
+      for (auto &n : names_) {
+        bool stale = n.id[0] == '\0';
+        if (!stale) {
+          stale = true;
+          for (const auto &r : records_) {
+            if (same_id(n, r)) {
+              stale = false;
+              break;
+            }
+          }
+        }
+        if (stale) {
+          slot = &n;
+          break;
+        }
+      }
+    }
+    if (slot == nullptr) {
+      return;
+    }
+    char name[sizeof(slot->name)];
+    copy_utf8(name, sizeof(name), info->name);
+    if (same_id(*slot, id) && std::strcmp(slot->name, name) == 0) {
+      return;
+    }
+    std::memset(slot, 0, sizeof(*slot));
+    copy_str(slot->id, sizeof(slot->id), id);
+    std::memcpy(slot->name, name, sizeof(name));
+    names_dirty_ = true;
+  }
+
+  // a name for events: the one learned, the connected server's, or its key
+  std::string display_name(const std::string &id) const {
+    const Name *n = find_name(id);
+    if (n != nullptr && n->name[0] != '\0') {
+      return n->name;
+    }
+    auto info = client_->get_server_information();
+    if (info && !id.empty() && info->server_id == id && !info->name.empty()) {
+      return info->name;
+    }
+    if (id.empty()) {
+      return "A server";
+    }
+    return "server " + id.substr(0, 8);
+  }
+
+  void load_names() {
+    nvs_handle_t h;
+    std::memset(names_, 0, sizeof(names_));
+    if (nvs_open(kAppNamespace, NVS_READONLY, &h) != ESP_OK) {
+      return;
+    }
+    size_t len = sizeof(names_);
+    if (nvs_get_blob(h, kNamesKey, names_, &len) != ESP_OK || len != sizeof(names_)) {
+      std::memset(names_, 0, sizeof(names_));
+    }
+    nvs_close(h);
+    for (auto &n : names_) {  // never trust a stored string's end
+      n.id[sizeof(n.id) - 1] = '\0';
+      n.name[sizeof(n.name) - 1] = '\0';
+    }
+  }
+
+  void save_names() {
+    nvs_handle_t h;
+    if (nvs_open(kAppNamespace, NVS_READWRITE, &h) == ESP_OK) {
+      nvs_set_blob(h, kNamesKey, names_, sizeof(names_));
+      nvs_commit(h);
+      nvs_close(h);
+    }
+  }
+
+  // the server's attempt waits for the gesture
+  bool waiting() const { return prompt_ && !gesture_; }
+  // an attempt runs: the operator types the code in the server
+  bool pairing_now() const { return attempt_until_us_ != 0 && !waiting(); }
+
+  void close_window_state() {
+    window_until_us_ = 0;
+    window_for_.clear();
+    window_failures_ = 0;
+  }
+
+  sendspin::SendspinClient *client_ = nullptr;
+  NvsStore *store_ = nullptr;
+  std::string code_;
+  bool from_page_ = false;
+  std::vector<std::string> records_;  // paired servers' keys
+  Name names_[kMaxRecords] = {};
+  bool names_dirty_ = false;
+  std::string attempt_id_;      // the server of the latest pairing attempt
+  int64_t attempt_until_us_ = 0;  // 0: no attempt under way
+  bool prompt_ = false;   // the library asked for the gesture (open..close)
+  bool gesture_ = false;  // ... and got it
+  int64_t window_until_us_ = 0;
+  std::string window_for_;  // the server it is bound to, "" = unbound
+  uint8_t window_failures_ = 0;
+  uint8_t led_ = 0;
+  int64_t next_refresh_us_ = 0;
+  int64_t next_publish_us_ = 0;
+  sendspin_pairing_t scratch_ = {};
+};
+
 class Player : public sendspin::PlayerRoleListener,
                public sendspin::SendspinClientListener {
  public:
   void attach(sendspin::SendspinClient *client, sendspin::PlayerRole *role,
-              I2sOutput *out) {
+              I2sOutput *out, Pairing *pairing) {
     client_ = client;
     role_ = role;
     out_ = out;
+    pairing_ = pairing;
     // held while the library asks for low-latency networking (streaming)
     esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "sendspin", &cpu_lock_);
   }
@@ -607,14 +1161,23 @@ class Player : public sendspin::PlayerRoleListener,
     }
   }
 
+  void on_pairing_started(const std::string &server_id) override {
+    pairing_->on_started(server_id);
+  }
+
   void on_pairing_succeeded(const std::string &server_id) override {
     ESP_LOGI(TAG, "paired with server %s", server_id.c_str());
+    pairing_->on_succeeded(server_id);
   }
 
   void on_pairing_failed(const std::string &server_id,
-                         sendspin::SendspinPairAbortReason) override {
+                         sendspin::SendspinPairAbortReason reason) override {
     ESP_LOGW(TAG, "pairing with server %s failed", server_id.c_str());
+    pairing_->on_failed(server_id, reason);
   }
+
+  void on_open_pairing_window() override { pairing_->on_open_window(); }
+  void on_close_pairing_window() override { pairing_->on_close_window(); }
 
   // every new connection (and a re-handshake after pairing) reports its trust
   void on_trust_changed(sendspin::ConnectionTrust trust) override {
@@ -626,6 +1189,7 @@ class Player : public sendspin::PlayerRoleListener,
     event_log_addf(EVENT_SRC_SENDSPIN, EVENT_INFO, "Server %s connected (%s)",
                    server_name_.empty() ? "?" : server_name_.c_str(),
                    paired ? "paired" : "unpaired");
+    pairing_->on_trust(paired);
   }
 
   // Deltas (an absent field is unchanged). Kept here rather than read from
@@ -661,8 +1225,8 @@ class Player : public sendspin::PlayerRoleListener,
 
   // After client.start(): report the volume this player had before reboot.
   void restore_volume() {
-    volume_ = load_u8("vol").value_or(volume_);
-    muted_ = load_u8("mute").value_or(0) != 0;
+    volume_ = app_load_u8("vol").value_or(volume_);
+    muted_ = app_load_u8("mute").value_or(0) != 0;
     out_->set_gain(volume_, muted_);
     role_->update_volume(volume_);
     role_->update_muted(muted_);
@@ -699,8 +1263,8 @@ class Player : public sendspin::PlayerRoleListener,
 
     if (settings_dirty_ && !out_->is_open()) {
       settings_dirty_ = false;
-      save_u8("vol", volume_);
-      save_u8("mute", muted_ ? 1 : 0);
+      app_save_u8("vol", volume_);
+      app_save_u8("mute", muted_ ? 1 : 0);
     }
   }
 
@@ -738,7 +1302,7 @@ class Player : public sendspin::PlayerRoleListener,
       st.paired = trust_ == sendspin::ConnectionTrust::USER;
       auto info = client->get_server_information();
       if (info) {
-        copy_str(st.server_name, sizeof(st.server_name), info->name);
+        copy_utf8(st.server_name, sizeof(st.server_name), info->name);
       }
       if (have_group_) {
         st.have_group = true;
@@ -794,29 +1358,10 @@ class Player : public sendspin::PlayerRoleListener,
     }
   }
 
-  static std::optional<uint8_t> load_u8(const char *key) {
-    nvs_handle_t h;
-    uint8_t v = 0;
-    if (nvs_open(kAppNamespace, NVS_READONLY, &h) != ESP_OK) {
-      return std::nullopt;
-    }
-    esp_err_t err = nvs_get_u8(h, key, &v);
-    nvs_close(h);
-    return err == ESP_OK ? std::optional<uint8_t>(v) : std::nullopt;
-  }
-
-  static void save_u8(const char *key, uint8_t v) {
-    nvs_handle_t h;
-    if (nvs_open(kAppNamespace, NVS_READWRITE, &h) == ESP_OK) {
-      nvs_set_u8(h, key, v);  // NVS skips the write when nothing changed
-      nvs_commit(h);
-      nvs_close(h);
-    }
-  }
-
   sendspin::SendspinClient *client_ = nullptr;
   sendspin::PlayerRole *role_ = nullptr;
   I2sOutput *out_ = nullptr;
+  Pairing *pairing_ = nullptr;
   bool stream_active_ = false;
   bool holding_ = false;  // snapcast was asked to release the output
   int64_t release_at_us_ = 0;
@@ -842,20 +1387,6 @@ class Player : public sendspin::PlayerRoleListener,
 };
 
 #if CONFIG_SENDSPIN_ENABLE_METADATA
-// at most size-1 bytes, never splitting a UTF-8 character
-void copy_utf8(char *dst, size_t size, const std::string &src) {
-  size_t n = std::min(src.size(), size - 1);
-  if (n < src.size()) {
-    // src[n] is the first byte left out: if it continues a character, that
-    // character started earlier; cut before it
-    while (n > 0 && (static_cast<unsigned char>(src[n]) & 0xC0) == 0x80) {
-      n--;
-    }
-  }
-  std::memcpy(dst, src.data(), n);
-  dst[n] = '\0';
-}
-
 // Track details for the Status tab. Not for the event log: one entry per
 // song would push everything else out of it within hours.
 class NowPlaying : public sendspin::MetadataRoleListener {
@@ -928,6 +1459,62 @@ class NowPlaying : public sendspin::MetadataRoleListener {
 I2sOutput g_output;
 std::string g_name;
 
+// Delete every pairing record, then restart the device: the library keeps
+// the records in memory while it runs. (Stopping and restarting the client
+// instead would send every server a "shutdown" goodbye, and Music Assistant
+// would not come back by itself.) The device key and the Pairing PSK stay,
+// so the client ID does not change. Loop task, between two client loops, so
+// no write the library owes can land in between.
+[[noreturn]] void forget_paired(Pairing *pairing, NvsStore *store) {
+  const size_t count = pairing->paired_count();
+  bool erased = true;
+  for (size_t n = 0; n < kMaxRecords; n++) {
+    erased &= store->erase(sendspin::persistence_keys::record_slot_key(n));
+  }
+  erased &= store->erase(sendspin::persistence_keys::RECORD_ORDER);
+  erased &= store->commit();
+  app_erase(kNamesKey);
+  if (erased) {
+    event_log_addf(EVENT_SRC_SENDSPIN, EVENT_INFO,
+                   "Forgot %u paired Sendspin server%s (Status tab)",
+                   static_cast<unsigned>(count), count == 1 ? "" : "s");
+    event_log_note_restart(EVENT_INFO, "Restarting to forget the paired servers");
+  } else {
+    // whatever was erased stays erased; the restart reloads the rest
+    event_log_note_restart(EVENT_WARN,
+                           "Forgetting the paired servers partly failed; restarting");
+  }
+  // Let the page's request finish first. Blocking this task (not a timer)
+  // keeps the library from writing the erased records back meanwhile.
+  vTaskDelay(pdMS_TO_TICKS(1000));
+  esp_restart();
+}
+
+void run_command(uint8_t cmd, Pairing *pairing, NvsStore *store) {
+  switch (cmd) {
+    case SENDSPIN_CMD_ALLOW_PAIRING_BUTTON:
+      pairing->open_window("device button");
+      break;
+    case SENDSPIN_CMD_ALLOW_PAIRING_PAGE:
+      pairing->open_window("Status tab");
+      break;
+    case SENDSPIN_CMD_STOP_PAIRING:
+      pairing->close_window();
+      break;
+    case SENDSPIN_CMD_REQUIRE_PAIRING:
+      pairing->set_require(true);
+      break;
+    case SENDSPIN_CMD_ALLOW_UNPAIRED:
+      pairing->set_require(false);
+      break;
+    case SENDSPIN_CMD_FORGET_PAIRED:
+      forget_paired(pairing, store);
+      break;
+    default:
+      break;
+  }
+}
+
 void loop_task(void *) {
   // Everything here lives as long as the firmware runs.
   sendspin::SendspinClientConfig cfg;
@@ -943,6 +1530,11 @@ void loop_task(void *) {
   cfg.httpd_stack_size = 6144;
   cfg.protocol_task_psram_stack = true;
   cfg.protocol_task_stack_size = 9216;
+  // Pairing: the static code, shown on the Status tab ("device"). Each
+  // attempt also needs the pairing window (device button or Status tab).
+  const std::string code = load_or_make_pairing_code();
+  cfg.static_pairing_code = code;
+  cfg.static_pairing_code_locations = {"device"};
   auto *client = new sendspin::SendspinClient(std::move(cfg));
 
   sendspin::PlayerRoleConfig pcfg;
@@ -958,9 +1550,10 @@ void loop_task(void *) {
   sendspin::PlayerRole &role = client->add_player(std::move(pcfg));
 
   auto *player = new Player();
+  auto *pairing = new Pairing();
   auto *store = new NvsStore();
   auto *net = new Network();
-  player->attach(client, &role, &g_output);
+  player->attach(client, &role, &g_output, pairing);
 
   if (!g_output.init(&role)) {
     vTaskDelete(nullptr);
@@ -979,11 +1572,10 @@ void loop_task(void *) {
 #endif
   client->set_network_provider(net);
   client->set_persistence_provider(store);
-#if CONFIG_SENDSPIN_UNPAIRED_ACCESS
-  client->set_unpaired_access_enabled(true);
-#else
-  client->set_unpaired_access_enabled(false);
-#endif
+  // the build setting, unless the Status tab changed it
+  const bool unpaired = app_load_u8(kUnpairedKey).value_or(kUnpairedDefault) != 0;
+  pairing->init(client, store, code, unpaired != kUnpairedDefault);
+  client->set_unpaired_access_enabled(unpaired);
 
   if (!client->start()) {
     ESP_LOGE(TAG, "Sendspin client did not start");
@@ -991,6 +1583,8 @@ void loop_task(void *) {
     return;
   }
   player->restore_volume();
+  pairing->refresh_records();
+  g_started.store(true);
 
   mdns_txt_item_t txt[] = {
       {"path", "/sendspin"},
@@ -1002,14 +1596,19 @@ void loop_task(void *) {
     ESP_LOGE(TAG, "mDNS service: %s", esp_err_to_name(err));
   }
 
-  ESP_LOGI(TAG, "Sendspin player \"%s\" on port %d, client id %s",
+  ESP_LOGI(TAG, "Sendspin player \"%s\" on port %d, client id %s, pairing %s",
            g_name.c_str(), CONFIG_SENDSPIN_PLAYER_PORT,
-           client->client_id().c_str());
+           client->client_id().c_str(), unpaired ? "optional" : "required");
 
   for (;;) {
+    uint8_t cmd;
+    while (xQueueReceive(g_cmds, &cmd, 0) == pdTRUE) {
+      run_command(cmd, pairing, store);
+    }
     client->loop();
     player->poll();
     player->publish_status(client);
+    pairing->poll(g_output.is_open());
 #if CONFIG_SENDSPIN_ENABLE_METADATA
     now_playing->poll();
 #endif
@@ -1033,8 +1632,24 @@ extern "C" bool sendspin_player_get_now_playing(sendspin_now_playing_t *out) {
   return out->valid;
 }
 
+extern "C" bool sendspin_player_get_pairing(sendspin_pairing_t *out) {
+  taskENTER_CRITICAL(&g_pair_mux);
+  *out = g_pair;
+  taskEXIT_CRITICAL(&g_pair_mux);
+  return g_started.load();
+}
+
+extern "C" bool sendspin_player_command(sendspin_cmd_t cmd) {
+  if (g_cmds == nullptr || !g_started.load()) {
+    return false;
+  }
+  const uint8_t c = static_cast<uint8_t>(cmd);
+  return xQueueSend(g_cmds, &c, 0) == pdTRUE;
+}
+
 extern "C" void sendspin_player_start(const char *name) {
   g_name = (name && name[0]) ? name : "snapclient";
+  g_cmds = xQueueCreate(4, sizeof(uint8_t));
   // NVS writes happen on this task (persistence provider, volume), so its
   // stack stays in internal RAM
   if (xTaskCreatePinnedToCore(loop_task, "sendspin", 6144, nullptr, 4,
@@ -1058,5 +1673,12 @@ extern "C" bool sendspin_player_get_now_playing(sendspin_now_playing_t *out) {
   std::memset(out, 0, sizeof(*out));
   return false;
 }
+
+extern "C" bool sendspin_player_get_pairing(sendspin_pairing_t *out) {
+  std::memset(out, 0, sizeof(*out));
+  return false;
+}
+
+extern "C" bool sendspin_player_command(sendspin_cmd_t) { return false; }
 
 #endif

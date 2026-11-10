@@ -21,9 +21,7 @@
 #include "esp_http_server.h"
 #include "esp_timer.h"
 #include "event_log.h"
-#if CONFIG_RESCUE_MODE_ENABLE
-#include "web_rescue.h"
-#endif
+#include "web_rescue.h"  // the Host check (always built)
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
@@ -684,7 +682,7 @@ esp_err_t ui_http_add_status_section(const char *name, ui_status_section_fn fn) 
 /*
  * Status tab buttons, see ui_http_server.h
  */
-#define MAX_ACTIONS 4
+#define MAX_ACTIONS 12
 
 typedef struct {
 	const char *name;
@@ -712,6 +710,9 @@ esp_err_t ui_http_add_action(const char *name, ui_action_fn fn) {
 
 static esp_err_t action_post_handler(httpd_req_t *req) {
 	ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
+	// the board's IP address or a LAN name only: a page on another site that
+	// points its own name at this board (DNS rebinding) is refused
+	if (!web_rescue_host_allowed(req)) return ESP_OK;
 	char hdr[4];
 	if (httpd_req_get_hdr_value_str(req, "X-Status-Action", hdr, sizeof(hdr)) !=
 			ESP_OK ||
@@ -745,6 +746,8 @@ static esp_err_t action_post_handler(httpd_req_t *req) {
  */
 static esp_err_t status_get_handler(httpd_req_t *req) {
 	ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
+	// it shows the Sendspin pairing code: same host check as the actions
+	if (!web_rescue_host_allowed(req)) return ESP_OK;
 
 	status_section_t sections[STATUS_MAX_SECTIONS];
 	size_t count;
@@ -767,9 +770,8 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
 	}
 
 	// No CORS header, unlike the settings endpoints, so ordinary pages from
-	// other sites can't read the network details in here. (Like the rest of
-	// this server it doesn't check the Host header, so a DNS-rebinding page
-	// still could; nothing in it is secret.)
+	// other sites can't read this. The Host check at the top also refuses
+	// DNS-rebinding pages. Keep both: it includes the Sendspin pairing code.
 	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 	if (json == NULL) {
 		httpd_resp_set_status(req, "500 Internal Server Error");
@@ -823,7 +825,8 @@ static esp_err_t events_get_handler(httpd_req_t *req) {
 	int n = entries != NULL ? event_log_snapshot(entries, EVENT_LOG_SIZE) : -1;
 	size_t nruns = n >= 0 ? event_log_runs(runs, EVENT_LOG_RUNS) : 0;
 
-	// no CORS header: same reasoning as /api/status
+	// no CORS header, as for /api/status (no Host check here: keep secrets
+	// out of event texts)
 	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 	if (n < 0) {
 		free(entries);
@@ -925,9 +928,9 @@ static esp_err_t restart_post_handler(httpd_req_t *req) {
 #if CONFIG_RESCUE_MODE_ENABLE
 /* POST /api/rescue: reboot into rescue mode, whose setup page installs
  * firmware with image checks (the upstream port-8032 updater does none).
- * Guarded like the rescue page: needs the X-Web-Rescue header and an IP or
- * .local Host, and gets no CORS headers, so other web pages cannot trigger
- * it from a browser. */
+ * Guarded like the rescue page: needs the X-Web-Rescue header and a LAN Host
+ * (an IP or a local name, see web_rescue_allow in web_rescue.h), and gets no
+ * CORS headers, so other web pages cannot trigger it from a browser. */
 static void rescue_task(void *pv) {
 	vTaskDelay(pdMS_TO_TICKS(300));  // let the response go out
 	rescue_mode_request("Rescue mode requested from the settings page");
