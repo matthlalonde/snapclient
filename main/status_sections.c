@@ -25,6 +25,7 @@
 #include "esp_wifi.h"
 #include "event_log.h"
 #include "web_rescue.h"
+#include "wifi_roam.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "network_interface.h"
@@ -35,6 +36,9 @@
 #include "ui_http_server.h"
 
 static const char *TAG = "STATUS";
+
+#define MACFMT "%02X:%02X:%02X:%02X:%02X:%02X"
+#define MAC(b) (b)[0], (b)[1], (b)[2], (b)[3], (b)[4], (b)[5]
 
 // the name this boot runs under (mDNS, snapserver, Sendspin); a new name
 // from General Settings applies after a restart
@@ -271,6 +275,56 @@ static void output_section(cJSON *o) {
   cJSON_AddStringToObject(o, "source", "none");
 }
 
+// Roaming state, and the access points of this network from the last scan
+static void wifi_section(cJSON *o) {
+  wifi_roam_status_t w;
+  wifi_roam_get_status(&w);
+  int64_t now = esp_timer_get_time();
+  cJSON_AddStringToObject(o, "roaming", wifi_roam_state_name(w.state));
+  if (w.state == WIFI_ROAM_OFF) {
+    return;
+  }
+  cJSON_AddBoolToObject(o, "strongest_at_connect", w.strongest_at_connect);
+  if (w.rssi_avg != 0) {
+    cJSON_AddNumberToObject(o, "rssi_avg", w.rssi_avg);
+  }
+  cJSON_AddNumberToObject(o, "roams", w.roams);
+  if (w.last_roam_us != 0) {
+    cJSON_AddNumberToObject(o, "last_roam_s", seconds_since(w.last_roam_us, now));
+  }
+  cJSON_AddBoolToObject(o, "scan_pending", w.scan_pending);
+  if (w.last_scan_us != 0) {
+    cJSON_AddNumberToObject(o, "last_scan_s", seconds_since(w.last_scan_us, now));
+    cJSON *aps = cJSON_AddArrayToObject(o, "aps");
+    for (int i = 0; aps != NULL && i < w.ap_count; i++) {
+      char bssid[18];
+      snprintf(bssid, sizeof(bssid), MACFMT, MAC(w.aps[i].bssid));
+      cJSON *a = cJSON_CreateObject();
+      if (a == NULL) break;
+      cJSON_AddStringToObject(a, "bssid", bssid);
+      cJSON_AddNumberToObject(a, "channel", w.aps[i].channel);
+      cJSON_AddNumberToObject(a, "rssi", w.aps[i].rssi);
+      cJSON_AddItemToArray(aps, a);
+    }
+  }
+}
+
+#if CONFIG_WIFI_ROAMING
+// The Status tab's "Scan now" button
+static bool scan_action(void) { return wifi_roam_request_scan(); }
+
+// Audio is playing: roaming waits for a pause (a move costs seconds)
+static bool audio_busy(void) {
+  sendspin_status_t ss;
+  if (sendspin_player_get_status(&ss) && ss.output_open) {
+    return true;
+  }
+  snapcast_status_t sc;
+  snapcast_status_get(&sc);
+  return !player_output_released() && sc.player == SNAPCAST_PLAYER_PLAYING;
+}
+#endif
+
 // The page fetches /api/events only when these change
 static void events_section(cJSON *o) {
   cJSON_AddNumberToObject(o, "boot", event_log_boot());
@@ -353,8 +407,6 @@ static const char *wifi_reason_text(uint8_t reason) {
   }
 }
 
-#define MACFMT "%02X:%02X:%02X:%02X:%02X:%02X"
-#define MAC(b) (b)[0], (b)[1], (b)[2], (b)[3], (b)[4], (b)[5]
 
 // Runs on the event loop task (small stack): short texts only
 static void wifi_events(void *arg, esp_event_base_t base, int32_t id,
@@ -434,6 +486,11 @@ void status_sections_init(const char *name) {
   ui_http_add_status_section("sendspin", sendspin_section);
 #endif
   ui_http_add_status_section("device", device_section);
+  ui_http_add_status_section("wifi", wifi_section);
   ui_http_add_status_section("events", events_section);
+#if CONFIG_WIFI_ROAMING
+  ui_http_add_action("wifi-scan", scan_action);
+  wifi_roam_set_busy_cb(audio_busy);
+#endif
   ESP_LOGD(TAG, "status sections registered");
 }

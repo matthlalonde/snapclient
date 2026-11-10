@@ -5,6 +5,7 @@
 extern "C" {
 #endif
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <esp_err.h>
 
@@ -16,12 +17,21 @@ void init_http_server_task(void);
  * Status tab: GET /api/status answers with one JSON object holding a
  * sub-object per registered section, {"<name>": {...}, ...}, in the order
  * they were added. The callback fills its section and runs on the web
- * server's task (4 KB stack) every couple of seconds while the tab is open:
+ * server's task (6 KB stack) every couple of seconds while the tab is open:
  * copy a snapshot, never block or wait for a lock held across audio work.
  * `name` must stay valid forever (a string literal). Any task, any time.
  */
 typedef void (*ui_status_section_fn)(cJSON *section);
 esp_err_t ui_http_add_status_section(const char *name, ui_status_section_fn fn);
+
+/*
+ * Status tab buttons: POST /api/action/<name> with the header
+ * "X-Status-Action: 1" (pages from other sites can't send it) runs fn on the
+ * web server's task and answers {"ok": <result>}. fn must return quickly
+ * (start the work elsewhere). `name` must stay valid forever.
+ */
+typedef bool (*ui_action_fn)(void);
+esp_err_t ui_http_add_action(const char *name, ui_action_fn fn);
 
 typedef struct {
   char key[16];

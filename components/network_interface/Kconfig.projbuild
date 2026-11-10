@@ -305,4 +305,27 @@ menu "Wifi Configuration"
         help
             Set the Maximum retry to avoid station reconnecting to the AP unlimited when the AP is really inexistent.
             Set to 0 if unlimited reconnections are preferred.
+
+    config WIFI_ROAMING
+        bool "Move to a clearly stronger access point of the same network"
+        default n
+        help
+            Connect to the strongest access point of the network at start-up,
+            and while the signal stays weak, look for a clearly stronger one
+            now and then and move to it. Each move drops the connection for a
+            few seconds (this chip can't hand over seamlessly), so it only
+            happens for a large gain, rarely, and preferably when nothing is
+            playing.
+
+    config WIFI_ROAMING_WEAK_RSSI
+        int "Signal below which to look for a better access point (dBm)"
+        depends on WIFI_ROAMING
+        range -95 -50
+        default -75
+
+    config WIFI_ROAMING_MIN_GAIN
+        int "How much stronger another access point must be (dB)"
+        depends on WIFI_ROAMING
+        range 5 30
+        default 10
 endmenu

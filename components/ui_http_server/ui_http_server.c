@@ -682,6 +682,65 @@ esp_err_t ui_http_add_status_section(const char *name, ui_status_section_fn fn) 
 }
 
 /*
+ * Status tab buttons, see ui_http_server.h
+ */
+#define MAX_ACTIONS 4
+
+typedef struct {
+	const char *name;
+	ui_action_fn fn;
+} action_t;
+
+static action_t actions[MAX_ACTIONS];
+static size_t action_count = 0;
+
+esp_err_t ui_http_add_action(const char *name, ui_action_fn fn) {
+	if (name == NULL || fn == NULL) {
+		return ESP_ERR_INVALID_ARG;
+	}
+	esp_err_t ret = ESP_ERR_NO_MEM;
+	taskENTER_CRITICAL(&status_sections_mux);
+	if (action_count < MAX_ACTIONS) {
+		actions[action_count].name = name;
+		actions[action_count].fn = fn;
+		action_count++;
+		ret = ESP_OK;
+	}
+	taskEXIT_CRITICAL(&status_sections_mux);
+	return ret;
+}
+
+static esp_err_t action_post_handler(httpd_req_t *req) {
+	ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
+	char hdr[4];
+	if (httpd_req_get_hdr_value_str(req, "X-Status-Action", hdr, sizeof(hdr)) !=
+			ESP_OK ||
+		strcmp(hdr, "1") != 0) {
+		httpd_resp_set_status(req, "403 Forbidden");
+		return httpd_resp_sendstr(req, "missing X-Status-Action header");
+	}
+	const char *name = req->uri + strlen("/api/action/");
+	size_t len = strcspn(name, "?");
+	ui_action_fn fn = NULL;
+	taskENTER_CRITICAL(&status_sections_mux);
+	for (size_t i = 0; i < action_count; i++) {
+		if (strlen(actions[i].name) == len &&
+			strncmp(actions[i].name, name, len) == 0) {
+			fn = actions[i].fn;
+		}
+	}
+	taskEXIT_CRITICAL(&status_sections_mux);
+	if (fn == NULL) {
+		httpd_resp_set_status(req, "404 Not Found");
+		return httpd_resp_sendstr(req, "unknown action");
+	}
+	bool ok = fn();
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	httpd_resp_set_type(req, "application/json");
+	return httpd_resp_sendstr(req, ok ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+
+/*
  * GET /api/status: live state for the Status tab, see ui_http_server.h
  */
 static esp_err_t status_get_handler(httpd_req_t *req) {
@@ -1317,6 +1376,14 @@ esp_err_t start_server(const char *base_path, int port) {
 		.handler = status_get_handler,
 	};
 	httpd_register_uri_handler(server, &_status_get_handler);
+
+	/* URI handler for the Status tab's buttons */
+	httpd_uri_t _action_post_handler = {
+		.uri = "/api/action/*",
+		.method = HTTP_POST,
+		.handler = action_post_handler,
+	};
+	httpd_register_uri_handler(server, &_action_post_handler);
 
 	/* URI handler for the Status tab's event log */
 	httpd_uri_t _events_get_handler = {

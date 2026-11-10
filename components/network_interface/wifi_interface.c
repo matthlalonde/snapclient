@@ -21,6 +21,7 @@
 #include "network_interface.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
+#include "wifi_roam.h"
 
 #if ENABLE_WIFI_PROVISIONING
 #include "wifi_provisioning.h"
@@ -87,11 +88,16 @@ static void event_handler(void *arg, esp_event_base_t event_base, int event_id,
     esp_wifi_connect();
   } else if (event_base == WIFI_EVENT &&
              event_id == WIFI_EVENT_STA_DISCONNECTED) {
-    if ((s_retry_num < WIFI_MAXIMUM_RETRY) || (WIFI_MAXIMUM_RETRY == 0)) {
-      xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
-      connected = false;
-      xSemaphoreGive(connIpSemaphoreHandle);
+    // not connected any more, retries or not (it used to stay "connected"
+    // once the retries ran out, until the IP lease timed out)
+    xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+    connected = false;
+    xSemaphoreGive(connIpSemaphoreHandle);
 
+    if (wifi_roam_in_progress()) {
+      return;  // the roaming task connects to the access point it chose
+    }
+    if ((s_retry_num < WIFI_MAXIMUM_RETRY) || (WIFI_MAXIMUM_RETRY == 0)) {
       esp_wifi_connect();
       s_retry_num++;
       ESP_LOGV(TAG, "retry to connect to the AP");
@@ -212,6 +218,9 @@ void wifi_start(void) {
   ESP_ERROR_CHECK(esp_wifi_get_config(WIFI_IF_STA, &wifi_config));
   wifi_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+  // with roaming: scan all channels so the strongest access point is joined
+  // (sort_method alone does nothing with the stored fast scan)
+  wifi_roam_apply_connect_policy();
 
   ESP_ERROR_CHECK(esp_event_handler_register(
       WIFI_EVENT, ESP_EVENT_ANY_ID, (esp_event_handler_t)&event_handler, NULL));
@@ -221,6 +230,7 @@ void wifi_start(void) {
                                              &lost_ip_event_handler, NULL));
 
   ESP_ERROR_CHECK(esp_wifi_start());
+  wifi_roam_start();
 
   ESP_LOGI(TAG, "Starting provisioning");
 
@@ -254,6 +264,7 @@ void wifi_start(void) {
   /* Start Wi-Fi station */
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
   ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
+  wifi_roam_apply_connect_policy();
 
   ESP_ERROR_CHECK(esp_event_handler_register(
       WIFI_EVENT, ESP_EVENT_ANY_ID, (esp_event_handler_t)&event_handler, NULL));
@@ -263,6 +274,7 @@ void wifi_start(void) {
                                              &lost_ip_event_handler, NULL));
 
   ESP_ERROR_CHECK(esp_wifi_start());
+  wifi_roam_start();
 
   ESP_LOGI(TAG, "wifi_init_sta finished. Trying to connect to %s",
            wifi_config.sta.ssid);
