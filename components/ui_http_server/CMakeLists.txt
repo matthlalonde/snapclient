@@ -7,6 +7,9 @@ idf_component_register(SRCS "ui_http_server.c"
                                       html/settings-ui.js
                                       html/styles.css
                                       html/status.html
+                                      html/status-common.js
+                                      html/status-common.css
+                                      html/system.html
                                       html/general-settings.html
                                       html/dsp-settings.html
                                       html/dac-settings.html

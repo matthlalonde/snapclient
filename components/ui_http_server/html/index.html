@@ -108,6 +108,7 @@
       <li id="dsp-tab" style="display: none;"><a href="#" class="nav-link" data-page="dsp-settings.html">DSP Settings</a></li>
       <li id="dac-tab" style="display: none;"><a href="#" class="nav-link" data-page="dac-settings.html">DAC Settings</a></li>
       <li id="eq-tab" style="display: none;"><a href="#" class="nav-link" data-page="eq-settings.html">EQ</a></li>
+      <li><a href="#" class="nav-link" data-page="system.html">System</a></li>
     </ul>
   </nav>
 
@@ -157,6 +158,43 @@
       }
     }
 
+    // A page in the frame can say it's busy (the System tab while it installs
+    // firmware): window.pageBusy() returns why, or null
+    function frameBusyReason() {
+      try {
+        const w = document.getElementById('content-frame').contentWindow;
+        return w && typeof w.pageBusy === 'function' ? w.pageBusy() : null;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // Show a tab's page; hash: an element id on it. Pages call it through
+    // window.parent (Status → General Settings for pairing). False when the
+    // user chose to stay.
+    function openTab(page, hash) {
+      const why = frameBusyReason();
+      if (why) {
+        if (!confirm(`${why} Leave this tab anyway?`)) return false;
+        // asked already: no second question from the page's beforeunload
+        try {
+          document.getElementById('content-frame').contentWindow.leaveConfirmed = true;
+        } catch (e) {
+          // not ours to touch
+        }
+      }
+      document.querySelectorAll('.nav-link').forEach(l =>
+        l.classList.toggle('active', l.getAttribute('data-page') === page));
+      // Preserve backend parameter if present
+      const urlParams = new URLSearchParams(window.location.search);
+      const backend = urlParams.get('backend');
+      let src = backend ? `${page}?backend=${encodeURIComponent(backend)}` : page;
+      if (hash) src += `#${encodeURIComponent(hash)}`;
+      document.getElementById('content-frame').src = src;
+      return true;
+    }
+    window.openTab = openTab;
+
     // Handle navigation
     document.addEventListener('DOMContentLoaded', function() {
       const navLinks = document.querySelectorAll('.nav-link');
@@ -168,27 +206,27 @@
       navLinks.forEach(link => {
         link.addEventListener('click', function(e) {
           e.preventDefault();
-          
-          // Update active state
-          navLinks.forEach(l => l.classList.remove('active'));
-          this.classList.add('active');
-          
-          // Load the page in iframe
-          const page = this.getAttribute('data-page');
-          
-          // Preserve backend parameter if present
-          const urlParams = new URLSearchParams(window.location.search);
-          const backend = urlParams.get('backend');
-          const iframeSrc = backend ? `${page}?backend=${encodeURIComponent(backend)}` : page;
-          
-          contentFrame.src = iframeSrc;
+          openTab(this.getAttribute('data-page'));
         });
       });
 
       // Load initial page with backend parameter if present
       const urlParams = new URLSearchParams(window.location.search);
       const backend = urlParams.get('backend');
-      if (backend) {
+      // a tab named in the address (http://<device>/#system), at start and
+      // when only the address's #name changes
+      function namedTab() {
+        const named = location.hash.slice(1);
+        const tab = Array.from(navLinks).find(l => named && l.getAttribute('data-page') === `${named}.html`);
+        return tab ? tab.getAttribute('data-page') : null;
+      }
+      window.addEventListener('hashchange', () => {
+        const page = namedTab();
+        if (page) openTab(page);
+      });
+      if (namedTab()) {
+        openTab(namedTab());
+      } else if (backend) {
         const initialPage = 'status.html';
         contentFrame.src = `${initialPage}?backend=${encodeURIComponent(backend)}`;
       }

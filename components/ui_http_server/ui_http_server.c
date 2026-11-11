@@ -51,6 +51,12 @@ extern const uint8_t styles_css_start[] asm("_binary_styles_css_start");
 extern const uint8_t styles_css_end[] asm("_binary_styles_css_end");
 extern const uint8_t status_html_start[] asm("_binary_status_html_start");
 extern const uint8_t status_html_end[] asm("_binary_status_html_end");
+extern const uint8_t status_common_js_start[] asm("_binary_status_common_js_start");
+extern const uint8_t status_common_js_end[] asm("_binary_status_common_js_end");
+extern const uint8_t status_common_css_start[] asm("_binary_status_common_css_start");
+extern const uint8_t status_common_css_end[] asm("_binary_status_common_css_end");
+extern const uint8_t system_html_start[] asm("_binary_system_html_start");
+extern const uint8_t system_html_end[] asm("_binary_system_html_end");
 extern const uint8_t general_settings_html_start[] asm("_binary_general_settings_html_start");
 extern const uint8_t general_settings_html_end[] asm("_binary_general_settings_html_end");
 extern const uint8_t dsp_settings_html_start[] asm("_binary_dsp_settings_html_start");
@@ -77,6 +83,9 @@ static const embedded_file_t embedded_files[] = {
 	{"/settings-ui.js", settings_ui_js_start, settings_ui_js_end, "application/javascript; charset=utf-8"},
 	{"/styles.css", styles_css_start, styles_css_end, "text/css; charset=utf-8"},
 	{"/status.html", status_html_start, status_html_end, "text/html; charset=utf-8"},
+	{"/status-common.js", status_common_js_start, status_common_js_end, "application/javascript; charset=utf-8"},
+	{"/status-common.css", status_common_css_start, status_common_css_end, "text/css; charset=utf-8"},
+	{"/system.html", system_html_start, system_html_end, "text/html; charset=utf-8"},
 	{"/general-settings.html", general_settings_html_start, general_settings_html_end, "text/html; charset=utf-8"},
 	{"/dsp-settings.html", dsp_settings_html_start, dsp_settings_html_end, "text/html; charset=utf-8"},
 	{"/dac-settings.html", dac_settings_html_start, dac_settings_html_end, "text/html; charset=utf-8"},
@@ -647,7 +656,8 @@ static esp_err_t get_capabilities_handler(httpd_req_t *req) {
 }
 
 /*
- * Status tab: sections registered by the rest of the firmware
+ * Live tabs (Status, System, pairing): sections registered by the rest of
+ * the firmware
  */
 #define STATUS_MAX_SECTIONS 8
 
@@ -680,7 +690,7 @@ esp_err_t ui_http_add_status_section(const char *name, ui_status_section_fn fn) 
 }
 
 /*
- * Status tab buttons, see ui_http_server.h
+ * Buttons on the live tabs, see ui_http_server.h
  */
 #define MAX_ACTIONS 12
 
@@ -742,7 +752,7 @@ static esp_err_t action_post_handler(httpd_req_t *req) {
 }
 
 /*
- * GET /api/status: live state for the Status tab, see ui_http_server.h
+ * GET /api/status: live state for the live tabs, see ui_http_server.h
  */
 static esp_err_t status_get_handler(httpd_req_t *req) {
 	ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
@@ -806,7 +816,7 @@ static void json_escape(char *dst, size_t size, const char *src) {
 
 /*
  * GET /api/events: the event log, oldest first, and the last few starts,
- * newest first. The Status tab fetches it when /api/status reports a change.
+ * newest first. The System tab fetches it when /api/status reports a change.
  * Times are milliseconds since the start of the run ("boot") each belongs
  * to. Streamed one entry at a time to keep the memory use small; 503 when
  * the log is busy, so the page tries again.
@@ -1372,7 +1382,7 @@ esp_err_t start_server(const char *base_path, int port) {
 	};
 	httpd_register_uri_handler(server, &_get_capabilities_handler);
 
-	/* URI handler for the Status tab's live data */
+	/* URI handler for the live tabs' data */
 	httpd_uri_t _status_get_handler = {
 		.uri = "/api/status",
 		.method = HTTP_GET,
@@ -1380,7 +1390,7 @@ esp_err_t start_server(const char *base_path, int port) {
 	};
 	httpd_register_uri_handler(server, &_status_get_handler);
 
-	/* URI handler for the Status tab's buttons */
+	/* URI handler for the live tabs' buttons */
 	httpd_uri_t _action_post_handler = {
 		.uri = "/api/action/*",
 		.method = HTTP_POST,
@@ -1388,7 +1398,7 @@ esp_err_t start_server(const char *base_path, int port) {
 	};
 	httpd_register_uri_handler(server, &_action_post_handler);
 
-	/* URI handler for the Status tab's event log */
+	/* URI handler for the System tab's event log */
 	httpd_uri_t _events_get_handler = {
 		.uri = "/api/events",
 		.method = HTTP_GET,

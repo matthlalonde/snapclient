@@ -1,5 +1,5 @@
 // A short log of notable events (connections, interruptions, restarts) for
-// the settings page's Status tab.
+// the settings page's System tab.
 //
 // The newest EVENT_LOG_SIZE events live in RTC memory, which keeps its
 // contents through crashes, watchdog resets and software restarts (not

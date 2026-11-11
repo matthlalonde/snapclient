@@ -8,7 +8,7 @@
 //   - NVS for the device identity (X25519 key) and pairing records
 //   - mDNS (_sendspin._tcp) so Music Assistant finds the player
 //   - pairing: a static code, a pairing window opened by the device button or
-//     the Status tab, and the "require pairing" setting
+//     General Settings, and the "require pairing" setting
 //
 // Sync rests on exact playback reports. Every DMA buffer is written whole as
 // [real audio][silence padding], and a lockstep queue records how many real
@@ -118,14 +118,14 @@ portMUX_TYPE g_status_mux = portMUX_INITIALIZER_UNLOCKED;
 // what is playing: written by the loop task (metadata listener, progress)
 sendspin_now_playing_t g_np = {};
 portMUX_TYPE g_np_mux = portMUX_INITIALIZER_UNLOCKED;
-// pairing state for the Status tab: written by the loop task
+// pairing state for General Settings: written by the loop task
 sendspin_pairing_t g_pair = {};
 portMUX_TYPE g_pair_mux = portMUX_INITIALIZER_UNLOCKED;
 // commands from other tasks (web server, button) for the loop task
 QueueHandle_t g_cmds = nullptr;
 std::atomic<bool> g_started{false};
 
-// "Let servers play without pairing" from the build; the Status tab can
+// "Let servers play without pairing" from the build; General Settings can
 // change it (saved in NVS only while it differs from this)
 #if CONFIG_SENDSPIN_UNPAIRED_ACCESS
 constexpr bool kUnpairedDefault = true;
@@ -146,7 +146,7 @@ constexpr int64_t kRecordsRefreshUs = 60LL * 1000 * 1000;
 constexpr size_t kMaxRecords =
     sendspin::SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS;
 static_assert(kMaxRecords == SENDSPIN_MAX_PAIRED,
-              "the Status tab lists every pairing record");
+              "General Settings lists every pairing record");
 
 void copy_str(char *dst, size_t size, const std::string &src) {
   size_t n = std::min(src.size(), size - 1);
@@ -641,13 +641,13 @@ const char *abort_text(sendspin::SendspinPairAbortReason reason) {
   }
 }
 
-// Pairing state for the Status tab and the LED, and the commands that change
+// Pairing state for General Settings and the LED, and the commands that change
 // it. Loop task only; the library calls its listeners there too.
 //
 // The library keeps its pairing window to itself, so the window here follows
 // its rules from what can be seen (pairing.md "Pairing Window"):
-//   - a gesture (button or Status tab) opens it for 5 minutes; with a server
-//     waiting, that server's attempt starts at once;
+//   - a gesture (button or General Settings) opens it for 5 minutes; with a
+//     server waiting, that server's attempt starts at once;
 //   - the first attempt under it binds it to that server's connection;
 //   - it closes when a pairing under it succeeds, after five wrong codes, on
 //     Stop, at expiry, and when its connection is lost.
@@ -783,8 +783,8 @@ class Pairing {
                      display_name(attempt_id_).c_str());
     } else if (window_until_us_ != 0 || waiting()) {
       event_log_add(EVENT_SRC_SENDSPIN, EVENT_INFO,
-                    waiting() ? "Pairing refused (Status tab)"
-                              : "Pairing window closed (Status tab)");
+                    waiting() ? "Pairing refused (settings page)"
+                              : "Pairing window closed (settings page)");
     }
     close_window_state();
   }
@@ -805,8 +805,8 @@ class Pairing {
     if (changed) {
       event_log_add(EVENT_SRC_SENDSPIN, EVENT_INFO,
                     require ? "Pairing required: unpaired servers are refused "
-                              "(Status tab)"
-                            : "Unpaired servers may play (Status tab)");
+                              "(settings page)"
+                            : "Unpaired servers may play (settings page)");
     }
   }
 
@@ -1476,7 +1476,7 @@ std::string g_name;
   app_erase(kNamesKey);
   if (erased) {
     event_log_addf(EVENT_SRC_SENDSPIN, EVENT_INFO,
-                   "Forgot %u paired Sendspin server%s (Status tab)",
+                   "Forgot %u paired Sendspin server%s (settings page)",
                    static_cast<unsigned>(count), count == 1 ? "" : "s");
     event_log_note_restart(EVENT_INFO, "Restarting to forget the paired servers");
   } else {
@@ -1496,7 +1496,7 @@ void run_command(uint8_t cmd, Pairing *pairing, NvsStore *store) {
       pairing->open_window("device button");
       break;
     case SENDSPIN_CMD_ALLOW_PAIRING_PAGE:
-      pairing->open_window("Status tab");
+      pairing->open_window("settings page");
       break;
     case SENDSPIN_CMD_STOP_PAIRING:
       pairing->close_window();
@@ -1530,8 +1530,9 @@ void loop_task(void *) {
   cfg.httpd_stack_size = 6144;
   cfg.protocol_task_psram_stack = true;
   cfg.protocol_task_stack_size = 9216;
-  // Pairing: the static code, shown on the Status tab ("device"). Each
-  // attempt also needs the pairing window (device button or Status tab).
+  // Pairing: the static code, shown on General Settings ("device"). Each
+  // attempt also needs the pairing window (device button or General
+  // Settings).
   const std::string code = load_or_make_pairing_code();
   cfg.static_pairing_code = code;
   cfg.static_pairing_code_locations = {"device"};
@@ -1572,7 +1573,7 @@ void loop_task(void *) {
 #endif
   client->set_network_provider(net);
   client->set_persistence_provider(store);
-  // the build setting, unless the Status tab changed it
+  // the build setting, unless General Settings changed it
   const bool unpaired = app_load_u8(kUnpairedKey).value_or(kUnpairedDefault) != 0;
   pairing->init(client, store, code, unpaired != kUnpairedDefault);
   client->set_unpaired_access_enabled(unpaired);

@@ -1,0 +1,138 @@
+/* Cards of the pages that show live state: Status and System */
+
+body {
+  font-family: Arial, sans-serif;
+  max-width: 800px;
+  margin: 20px auto;
+  padding: 20px;
+  background-color: #f5f5f5;
+  color: #333;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+.cards {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.card {
+  background-color: white;
+  padding: 20px;
+  border-radius: 8px;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.card h2 {
+  font-size: 16px;
+  margin: 0 0 12px 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.card h3 {
+  font-size: 14px;
+  margin: 0 0 10px 0;
+}
+
+.card.stale {
+  opacity: 0.55;
+}
+
+/* a block inside a card, under a line */
+.card .part {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid #e9ecef;
+}
+
+.card .warning,
+.card .error,
+.card .success,
+.card .info {
+  margin: 0 0 12px 0;
+  padding: 10px 12px;
+  font-size: 14px;
+}
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: bold;
+  background-color: #e9ecef;
+  color: #495057;
+}
+
+.badge.ok { background-color: #d4edda; color: #155724; }
+.badge.warn { background-color: #fff3cd; color: #856404; }
+.badge.off { background-color: #e9ecef; color: #6c757d; }
+
+dl {
+  display: grid;
+  grid-template-columns: minmax(130px, 34%) 1fr;
+  gap: 6px 16px;
+  margin: 0;
+  font-size: 14px;
+}
+
+dt {
+  color: #666;
+}
+
+dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+  white-space: pre-line;  /* a list of access points, one per line */
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.actions .hint {
+  margin-top: 0;
+}
+
+.hint {
+  color: #888;
+  font-size: 12px;
+  margin-top: 12px;
+}
+
+.updated {
+  color: #888;
+  font-size: 12px;
+  text-align: right;
+}
+
+#offline {
+  display: none;
+  margin: 0 0 20px 0;
+}
+
+@media (max-width: 480px) {
+  body {
+    margin: 0;
+    padding: 16px;
+  }
+
+  dl {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+
+  dd {
+    margin-bottom: 8px;
+  }
+}

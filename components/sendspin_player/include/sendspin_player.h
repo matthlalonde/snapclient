@@ -74,9 +74,9 @@ bool sendspin_player_get_now_playing(sendspin_now_playing_t *out);
  * Pairing. A paired server holds a key this device stored when the two
  * paired; with "require pairing" on, only paired servers may play.
  *
- * A server pairs with the static 8-digit code shown on the Status tab, and
+ * A server pairs with the static 8-digit code shown on General Settings, and
  * only while the pairing window is open: a short press of the device button
- * or the Status tab's "Allow pairing" opens it for 5 minutes (one server
+ * or "Allow pairing" on General Settings opens it for 5 minutes (one server
  * connection may pair under it).
  */
 #define SENDSPIN_MAX_PAIRED 12
@@ -90,7 +90,7 @@ typedef struct {
 typedef struct {
   char code[9];              // the static pairing code, "" if none
   bool require_pairing;      // unpaired servers are refused
-  bool require_from_page;    // set on the Status tab (else the build setting)
+  bool require_from_page;    // set on General Settings (else the build setting)
   bool window_open;          // a server may pair now
   uint16_t window_left_s;    // about how long it stays open
   char window_for[48];       // reserved for this server's connection ("" = any)
@@ -110,7 +110,7 @@ bool sendspin_player_get_pairing(sendspin_pairing_t *out);
 
 typedef enum {
   SENDSPIN_CMD_ALLOW_PAIRING_BUTTON,  // the device button: open the window
-  SENDSPIN_CMD_ALLOW_PAIRING_PAGE,    // the Status tab: open the window
+  SENDSPIN_CMD_ALLOW_PAIRING_PAGE,    // General Settings: open the window
   SENDSPIN_CMD_STOP_PAIRING,          // close the window
   SENDSPIN_CMD_REQUIRE_PAIRING,       // refuse unpaired servers (saved)
   SENDSPIN_CMD_ALLOW_UNPAIRED,        // let unpaired servers play (saved)

@@ -1403,7 +1403,7 @@ void app_main(void) {
   // our image header; let esp_flash reach the whole chip
   web_rescue_unlock_physical_flash();
 #endif
-  // Status tab event log: keep what happened before this restart, record why
+  // System tab event log: keep what happened before this restart, record why
   // it restarted (after the unlock: this reads the partition table)
   event_log_init();
   status_events_boot();
@@ -1628,7 +1628,7 @@ void app_main(void) {
   #endif
 
   init_http_server_task();
-  // live state for the settings page's Status tab
+  // live state for the settings page's Status and System tabs
   status_sections_init(mdns_hostname);
 
   // Enable websocket server

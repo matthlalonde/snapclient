@@ -69,8 +69,8 @@ bool wifi_roam_in_progress(void);
 // pause. Optional.
 void wifi_roam_set_busy_cb(bool (*busy)(void));
 
-// Scan now (the Status tab's button). False when one ran in the last 20 s or
-// roaming is off.
+// Scan now (the System tab's "Scan for access points" button). False when one
+// ran in the last 20 s or roaming is off.
 bool wifi_roam_request_scan(void);
 
 void wifi_roam_get_status(wifi_roam_status_t *out);

@@ -5,7 +5,7 @@ extern "C" {
 #endif
 
 /**
- * Register the settings page's Status tab sections (GET /api/status):
+ * Register the settings page's live sections (GET /api/status):
  * output, snapcast, sendspin and device. `name` is the name this boot runs
  * under; it is copied.
  */

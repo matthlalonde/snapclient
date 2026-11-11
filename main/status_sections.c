@@ -1,8 +1,9 @@
-// The settings page's Status tab (GET /api/status, see ui_http_server.h):
+// The settings page's live tabs (GET /api/status, see ui_http_server.h):
 //   output    which source owns the I2S output (AUX and optical) and its format
 //   snapcast  server connection, stream, sync health
 //   sendspin  server, group, stream, volume, pairing
-//   device    firmware, uptime, last reset, WiFi, memory, stack headroom
+//   device    firmware, OTA state and update slot, uptime, last reset, WiFi,
+//             memory, stack headroom
 //   events    a change counter for the event log (GET /api/events)
 // It also records the start-up and WiFi events in the event log.
 // Each section runs on the web server's task and only copies snapshots that
@@ -49,6 +50,34 @@ static double seconds_since(int64_t then_us, int64_t now_us) {
   return (double)((now_us - then_us) / 1000000);
 }
 
+// The running slot's OTA state, named like the rescue page does: "valid" once
+// confirmed (rescue_mode.c: 60 s with an IP, or a rescue-page request),
+// "pending-verify" until then, "" without OTA data. Read from flash until it
+// is valid, then kept: it can't change back while this firmware runs.
+static const char *ota_state_text(const esp_partition_t *running) {
+  static bool s_valid;  // the web server's task only
+  if (s_valid) return "valid";
+  esp_ota_img_states_t st;
+  if (running == NULL || esp_ota_get_state_partition(running, &st) != ESP_OK) {
+    return "";
+  }
+  switch (st) {
+    case ESP_OTA_IMG_VALID:
+      s_valid = true;
+      return "valid";
+    case ESP_OTA_IMG_PENDING_VERIFY:
+      return "pending-verify";
+    case ESP_OTA_IMG_NEW:
+      return "new";
+    case ESP_OTA_IMG_INVALID:
+      return "invalid";
+    case ESP_OTA_IMG_ABORTED:
+      return "aborted";
+    default:
+      return "undefined";
+  }
+}
+
 static void device_section(cJSON *o) {
   const esp_app_desc_t *app = esp_app_get_description();
   const esp_partition_t *running = esp_ota_get_running_partition();
@@ -59,9 +88,29 @@ static void device_section(cJSON *o) {
   snprintf(built, sizeof(built), "%s %s", app->date, app->time);
   cJSON_AddStringToObject(o, "built", built);
   cJSON_AddStringToObject(o, "idf", app->idf_ver);
+  // tells two builds apart when version and build time are the same (an
+  // incremental build): the System tab compares it with an update file's
+  char sha[2 * sizeof(app->app_elf_sha256) + 1];
+  for (size_t i = 0; i < sizeof(app->app_elf_sha256); i++) {
+    snprintf(sha + 2 * i, 3, "%02x", app->app_elf_sha256[i]);
+  }
+  cJSON_AddStringToObject(o, "elf_sha256", sha);
   if (running != NULL) {
     cJSON_AddStringToObject(o, "slot", running->label);
+    const char *state = ota_state_text(running);
+    if (state[0] != '\0') cJSON_AddStringToObject(o, "ota_state", state);
   }
+  // the System tab installs firmware through rescue mode, into this slot
+  const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+  if (next != NULL && (running == NULL || next->address != running->address)) {
+    cJSON_AddStringToObject(o, "update_slot", next->label);
+    cJSON_AddNumberToObject(o, "update_slot_size", next->size);
+  }
+#if CONFIG_RESCUE_MODE_ENABLE
+  cJSON_AddBoolToObject(o, "rescue_mode", true);
+#else
+  cJSON_AddBoolToObject(o, "rescue_mode", false);
+#endif
   cJSON_AddNumberToObject(o, "uptime_s", seconds_since(0, esp_timer_get_time()));
   cJSON_AddStringToObject(o, "reset_reason",
                           event_log_reset_reason_text(esp_reset_reason()));
@@ -315,7 +364,8 @@ static void sendspin_section(cJSON *o) {
   free(pr);
 }
 
-// Status tab buttons: the Sendspin task carries them out within ~20 ms
+// Pairing buttons (General Settings): the Sendspin task carries them out
+// within ~20 ms
 static bool pair_allow_action(void) {
   return sendspin_player_command(SENDSPIN_CMD_ALLOW_PAIRING_PAGE);
 }
@@ -394,7 +444,7 @@ static void wifi_section(cJSON *o) {
 }
 
 #if CONFIG_WIFI_ROAMING
-// The Status tab's "Scan now" button
+// The System tab's "Scan for access points" button
 static bool scan_action(void) { return wifi_roam_request_scan(); }
 
 // Audio is playing: roaming waits for a pause (a move costs seconds)

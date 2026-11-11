@@ -1,0 +1,1033 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>System</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="status-common.css">
+  <script src="index.js"></script>
+  <script src="status-common.js"></script>
+  <style>
+    /* Firmware update */
+    .file-input {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .steps {
+      list-style: none;
+      margin: 0 0 12px 0;
+      padding: 0;
+      font-size: 14px;
+    }
+
+    .steps li {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 0;
+      color: #888;
+    }
+
+    .steps li::before {
+      content: '○';
+      width: 1.2em;
+      text-align: center;
+    }
+
+    .steps li.active { color: #333; font-weight: bold; }
+    .steps li.active::before { content: '●'; color: #007bff; }
+    .steps li.done { color: #333; }
+    .steps li.done::before { content: '✓'; color: #28a745; }
+    .steps li.failed { color: #721c24; font-weight: bold; }
+    .steps li.failed::before { content: '✕'; color: #dc3545; }
+
+    .steps progress {
+      flex: 1;
+      max-width: 240px;
+      height: 10px;
+    }
+
+    .steps .pct {
+      font-weight: normal;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Recent events */
+    .events {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      font-size: 14px;
+    }
+
+    .events li {
+      display: grid;
+      grid-template-columns: 7.5em 5.5em 1fr;
+      gap: 8px;
+      padding: 6px 8px;
+      border-left: 3px solid #dee2e6;
+      margin-bottom: 4px;
+    }
+
+    /* lvl-*: styles.css already has .info/.error boxes */
+    .events li.lvl-warn { border-left-color: #f0ad4e; background-color: #fffaf0; }
+    .events li.lvl-error { border-left-color: #dc3545; background-color: #fdf2f3; }
+
+    .events .when {
+      color: #666;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .events .src {
+      color: #666;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      padding-top: 1px;
+    }
+
+    .events .what {
+      overflow-wrap: anywhere;
+    }
+
+    .events li.run {
+      display: block;
+      border: none;
+      color: #333;
+      font-weight: bold;
+      font-size: 13px;
+      padding: 10px 0 4px 0;
+    }
+
+    @media (max-width: 480px) {
+      .events li {
+        grid-template-columns: auto 1fr;
+      }
+
+      .events .what {
+        grid-column: 1 / -1;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="offline" class="warning" role="status">Can't reach the device. Retrying&hellip;</div>
+
+  <div class="cards">
+    <div class="card" id="card-device" hidden>
+      <h2>Device <span class="badge" id="badge-device" hidden></span></h2>
+      <dl id="rows-device"></dl>
+
+      <div class="part" id="update" hidden>
+        <h3>Firmware update</h3>
+
+        <!-- choose a file -->
+        <div id="update-pick">
+          <div class="actions">
+            <input class="file-input" type="file" id="update-file" accept=".bin,application/octet-stream" tabindex="-1">
+            <button class="btn btn-primary" id="update-choose" type="button">Choose a firmware file&hellip;</button>
+            <span class="hint">The app image, such as snapclient.bin, not the *-merged.bin.</span>
+          </div>
+        </div>
+
+        <!-- what's in it -->
+        <div id="update-check" hidden>
+          <div class="error" id="update-bad" role="alert" hidden></div>
+          <dl id="rows-update"></dl>
+          <div class="warning" id="update-warn" role="status" hidden></div>
+          <div class="warning" id="update-host" role="status" hidden>
+            <span id="update-host-text"></span>
+            <a id="update-host-link" target="_top">Open this page by its IP address</a>
+          </div>
+          <div class="actions">
+            <button class="btn btn-danger" id="update-install" type="button">Install</button>
+            <button class="btn btn-secondary" id="update-cancel" type="button">Cancel</button>
+          </div>
+          <div class="hint" id="update-install-hint">The device restarts into rescue mode,
+            takes the file and restarts into it: all audio stops for about a minute.
+            Keep this tab open until it's done.</div>
+        </div>
+
+        <!-- installing -->
+        <div id="update-run" hidden>
+          <ol class="steps" id="update-steps">
+            <li data-step="rescue">Restart into rescue mode</li>
+            <li data-step="upload">Send the file <progress id="update-progress" max="1" value="0" hidden></progress> <span class="pct" id="update-pct"></span></li>
+            <li data-step="install">Write and check it, then restart</li>
+            <li data-step="check">Start the new firmware</li>
+          </ol>
+          <div class="info" id="update-msg" role="status" hidden></div>
+          <div class="actions" id="update-after" hidden>
+            <button class="btn btn-primary" id="update-again" type="button" hidden>Choose another file</button>
+            <button class="btn btn-secondary" id="update-leave" type="button" hidden>Restart without updating</button>
+            <button class="btn btn-secondary" id="update-close" type="button" hidden>Done</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" id="card-wifi" hidden>
+      <h2>WiFi <span class="badge" id="badge-wifi"></span></h2>
+      <dl id="rows-wifi"></dl>
+      <div class="actions" id="wifi-actions" hidden>
+        <button class="btn btn-secondary" id="scan-btn" type="button">Scan for access points</button>
+        <span class="hint" id="scan-note"></span>
+      </div>
+    </div>
+
+    <div class="card" id="card-events" hidden>
+      <h2>Recent events</h2>
+      <ul class="events" id="starts"></ul>
+      <ul class="events" id="events"></ul>
+      <div class="hint">The last 40 events, newest first. They survive
+        restarts and crashes, but not a power cut.</div>
+    </div>
+  </div>
+
+  <div class="hint">Updates every 2 seconds while this tab is open.</div>
+
+  <script>
+    'use strict';
+
+    // ---- Device card ----
+
+    // ota_state: how the slot's firmware stands (null: say nothing).
+    // "new" after a restart: the bootloader has no rollback (it would have
+    // made it "pending-verify"); the firmware confirms itself all the same.
+    const OTA_STATE = {
+      valid: 'confirmed',
+      'pending-verify': 'new: confirms itself after a minute on the network',
+      new: 'new: confirms itself after a minute on the network',
+      undefined: null,  // no OTA data (flashed over serial)
+    };
+
+    const DEVICE_ROWS = [
+      ['Name', s => s.name || null],
+      ['Firmware', s => s.firmware || null],
+      ['Built', s => has(s.built) ? (has(s.idf) ? `${s.built}, ESP-IDF ${s.idf}` : s.built) : null],
+      ['Running from', s => {
+        if (!has(s.slot)) return null;
+        const state = Object.prototype.hasOwnProperty.call(OTA_STATE, s.ota_state)
+          ? OTA_STATE[s.ota_state] : s.ota_state;
+        return has(state) ? `${s.slot} (${state})` : s.slot;
+      }],
+      ['Uptime', s => duration(s.uptime_s)],
+      ['Last restart', s => s.reset_reason || null],
+      ['IP address', s => s.ip || null],
+      ['Free RAM', s => has(s.heap_free)
+        ? `${kib(s.heap_free)} (lowest ${kib(s.heap_min)})`
+        : null],
+      ['Free PSRAM', s => has(s.psram_free) && s.psram_size > 0
+        ? `${kib(s.psram_free)} of ${kib(s.psram_size)} (lowest ${kib(s.psram_min)})`
+        : null],
+    ];
+
+    // ---- WiFi card: the device's link details plus the roaming section ----
+
+    const ROAMING = {
+      off: 'off (not built in)',
+      offline: 'not connected',
+      measuring: 'measuring the signal…',
+      good: 'signal above the roaming threshold',
+      weak: 'signal is weak; looking for a stronger access point now and then',
+      scanning: 'scanning…',
+      waiting: 'found a stronger access point; moving when playback stops',
+      moving: 'moving to another access point…',
+      cooldown: 'moved recently; next check in a few minutes',
+      failed: 'the last move failed, so it went back; trying again later',
+    };
+
+    function apList(s) {
+      if (!Array.isArray(s.aps)) return null;
+      if (s.aps.length === 0) return 'none found';
+      return s.aps.map(a =>
+        `${a.bssid}, channel ${a.channel}, ${a.rssi} dBm${a.bssid === s.wifi_bssid ? ' (connected)' : ''}`
+      ).join('\n');
+    }
+
+    const WIFI_ROWS = [
+      ['Network', s => has(s.wifi_ssid)
+        ? `${s.wifi_ssid}${has(s.wifi_channel) ? `, channel ${s.wifi_channel}` : ''}`
+        : null],
+      ['Access point', s => s.wifi_bssid || null],
+      ['Signal', s => {
+        const now = signal(s.wifi_rssi);
+        if (!now) return null;
+        return has(s.rssi_avg) ? `${now}; average ${s.rssi_avg} dBm` : now;
+      }],
+      ['Joins', s => has(s.strongest_at_connect)
+        ? (s.strongest_at_connect
+            ? 'the strongest access point (scans all channels)'
+            : 'the first access point it hears')
+        : null],
+      ['Roaming', s => ROAMING[s.roaming] || null],
+      ['Moves since boot', s => has(s.roams)
+        ? (s.roams > 0 && has(s.last_roam_s) ? `${s.roams} (last ${ago(s.last_roam_s)})` : String(s.roams))
+        : null],
+      [s => has(s.last_scan_s) ? `Access points (scan ${ago(s.last_scan_s)})` : 'Access points',
+        s => apList(s)],
+    ];
+
+    const WIFI_BADGE = {
+      measuring: ['measuring', 'off'],
+      good: ['signal ok', 'ok'],
+      weak: ['weak signal', 'warn'],
+      scanning: ['scanning', 'off'],
+      waiting: ['better AP found', 'warn'],
+      moving: ['moving', 'warn'],
+      cooldown: ['moved recently', 'ok'],
+      failed: ['move failed', 'warn'],
+      offline: ['not connected', 'off'],
+    };
+
+    let scanRequestedAt = null;
+
+    function renderWifi(st) {
+      const w = st.wifi || {};
+      const dev = st.device || {};
+      // WiFi builds only (an Ethernet board shows no WiFi card)
+      if (!has(dev.wifi_ssid) && (!has(w.roaming) || w.roaming === 'off')) {
+        renderCard('wifi', WIFI_ROWS, null);
+        return;
+      }
+      renderCard('wifi', WIFI_ROWS, Object.assign({}, dev, w));
+      const badge = WIFI_BADGE[w.roaming];
+      if (badge) setBadge('badge-wifi', badge[0], badge[1]);
+      else setBadge('badge-wifi', '', 'off');
+      const roaming = has(w.roaming) && w.roaming !== 'off';
+      document.getElementById('wifi-actions').hidden = !roaming;
+      const note = document.getElementById('scan-note');
+      if (w.scan_pending) {
+        note.textContent = 'Scanning…';
+      } else if (note.textContent === 'Scanning…' &&
+                 (scanRequestedAt === null ||  // someone else's scan, or a reload
+                  (has(w.last_scan_s) && Date.now() - w.last_scan_s * 1000 >= scanRequestedAt - 3000))) {
+        note.textContent = '';  // the result is shown
+        scanRequestedAt = null;
+      }
+    }
+
+    async function scanNow() {
+      const btn = document.getElementById('scan-btn');
+      const note = document.getElementById('scan-note');
+      btn.disabled = true;
+      note.textContent = 'Scanning…';
+      scanRequestedAt = Date.now();
+      try {
+        if (!await statusAction('wifi-scan')) {
+          note.textContent = 'Not now: a scan ran less than 20 s ago, or WiFi is reconnecting.';
+          scanRequestedAt = null;
+        }
+      } catch (error) {
+        note.textContent = "Couldn't reach the device.";
+        scanRequestedAt = null;
+      }
+      poller.soon();
+      // the board allows one scan every 20 s
+      setTimeout(() => {
+        btn.disabled = false;
+        if (note.textContent !== 'Scanning…') note.textContent = '';
+      }, 20000);
+    }
+
+    document.getElementById('scan-btn').addEventListener('click', scanNow);
+
+    // ---- recent events: fetched only when /api/status reports a change ----
+
+    let eventsKey = null;
+    let eventsInFlight = false;
+    let lastResetReason = null;
+    let lastBootAt = null;
+
+    function clock(ms) {
+      const d = new Date(ms);
+      const today = new Date();
+      const time = d.toLocaleTimeString();
+      return d.toDateString() === today.toDateString()
+        ? time
+        : `${d.toLocaleDateString()} ${time}`;
+    }
+
+    function startText(run, data, started) {
+      const unexplained = run.reason === 'restart (software)' && !run.explained
+        ? ' with no reason logged' : '';
+      if (run.boot === data.boot) {
+        return `This start (${clock(started)}): after ${run.reason}${unexplained}`;
+      }
+      const ran = run.last_ms > 0 ? `; ran at least ${duration(run.last_ms / 1000)}` : '';
+      return `Earlier start: after ${run.reason}${unexplained}${ran}`;
+    }
+
+    function renderStarts(data, started) {
+      const list = document.getElementById('starts');
+      const frag = document.createDocumentFragment();
+      const runs = data.runs || [];
+      if (runs.length > 0) {
+        const head = document.createElement('li');
+        head.className = 'run';
+        head.textContent = 'Recent starts';
+        frag.appendChild(head);
+      }
+      for (const run of runs) {
+        const li = document.createElement('li');
+        const crash = /crash|brownout|watchdog|power glitch|lockup/.test(run.reason);
+        const unexplained = run.reason === 'restart (software)' && !run.explained;
+        li.className = crash ? 'lvl-error' : unexplained ? 'lvl-warn' : 'lvl-info';
+        const what = document.createElement('span');
+        what.className = 'what';
+        what.style.gridColumn = '1 / -1';
+        what.textContent = startText(run, data, started);
+        li.appendChild(what);
+        frag.appendChild(li);
+      }
+      list.replaceChildren(frag);
+    }
+
+    function renderEvents(data, fetchedAt) {
+      const list = document.getElementById('events');
+      const card = document.getElementById('card-events');
+      const entries = (data.entries || []).slice().reverse();  // newest first
+      // this run started at about fetchedAt - uptime
+      const started = fetchedAt - data.uptime_ms;
+      renderStarts(data, started);
+      const frag = document.createDocumentFragment();
+      let group = null;
+
+      if (entries.length === 0) {
+        const li = document.createElement('li');
+        li.className = 'run';
+        li.textContent = 'No events yet.';
+        frag.appendChild(li);
+      }
+      for (const e of entries) {
+        const thisRun = e.boot === data.boot;
+        const g = thisRun ? 'now' : e.boot === data.boot - 1 ? 'prev' : 'older';
+        if (g !== group) {
+          group = g;
+          const li = document.createElement('li');
+          li.className = 'run';
+          li.textContent = g === 'now'
+            ? `Since the last start (${clock(started)})`
+            : g === 'prev'
+              ? `Before that start${lastResetReason ? ` (ended by: ${lastResetReason})` : ''}`
+              : 'Earlier runs';
+          frag.appendChild(li);
+        }
+        const li = document.createElement('li');
+        li.className = `lvl-${e.level}`;
+        const when = document.createElement('span');
+        when.className = 'when';
+        // earlier runs: no clock to go by, only the time since their start
+        when.textContent = thisRun ? clock(started + e.t_ms) : `+${duration(e.t_ms / 1000)}`;
+        const src = document.createElement('span');
+        src.className = 'src';
+        src.textContent = e.src;
+        const what = document.createElement('span');
+        what.className = 'what';
+        what.textContent = e.n > 1 ? `${e.text} (${e.n} times; time of the last)` : e.text;
+        li.append(when, src, what);
+        frag.appendChild(li);
+      }
+      list.replaceChildren(frag);
+      card.hidden = false;
+    }
+
+    async function fetchEvents(key) {
+      if (eventsInFlight) return;
+      eventsInFlight = true;
+      try {
+        const r = await fetchJson('/api/events');
+        if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
+        renderEvents(r.body, Date.now());
+        eventsKey = key;  // only once shown: a failed fetch retries next poll
+      } catch (error) {
+        console.error('Event log update failed:', error);
+      } finally {
+        eventsInFlight = false;
+      }
+    }
+
+    function updateEvents(st) {
+      if (st.device && st.device.reset_reason) lastResetReason = st.device.reset_reason;
+      // a restart also shows as a jump in when the board started: after a
+      // power cut the log starts over and boot:changes can repeat
+      if (st.device && typeof st.device.uptime_s === 'number') {
+        const bootAt = Date.now() - st.device.uptime_s * 1000;
+        if (lastBootAt !== null && Math.abs(bootAt - lastBootAt) > 5000) eventsKey = null;
+        lastBootAt = bootAt;
+      }
+      const ev = st.events;
+      if (!ev) return;
+      const key = `${ev.boot}:${ev.changes}`;
+      if (key !== eventsKey) fetchEvents(key);
+    }
+
+    // ---- firmware update ----
+    //
+    // Through rescue mode, which already installs firmware with image checks
+    // and runs none of the audio code: POST /api/rescue, wait until rescue
+    // mode answers /api/status (same address), POST the file to /api/update,
+    // then wait for normal mode and check which build it runs. The browser
+    // keeps the file, so this tab has to stay open.
+
+    const RESCUE_WAIT_MS = 120000;  // restart, rejoin WiFi, start the server
+    const BOOT_WAIT_MS = 180000;    // install, restart, join WiFi, start up
+    const WAIT_POLL_MS = 1500;
+    const UPLOAD_TIMEOUT_MS = 300000;
+    const WATCH_MS = 120000;  // after success: watch for a rollback this long
+
+    let device = null;      // the latest device section
+    let file = null;        // the chosen file and what's in it
+    let image = null;
+    let busy = false;       // an install is under way: no regular polling
+    let inRescue = false;   // the device was left in rescue mode by a failure
+    let before = null;      // what ran before the install
+    let watch = null;       // after an install: { image, until, slot }
+
+    const $ = id => document.getElementById(id);
+
+    function cString(bytes, offset, length) {
+      const part = bytes.subarray(offset, offset + length);
+      const end = part.indexOf(0);
+      return new TextDecoder('utf-8').decode(end >= 0 ? part.subarray(0, end) : part).trim();
+    }
+
+    // Read the image header and app description (esp_app_format.h), the same
+    // checks rescue mode makes before it writes anything (check_app_image)
+    async function readImage(f) {
+      const HEADER = 24, SEGMENT = 8, APP_DESC = 256;
+      const need = HEADER + SEGMENT + APP_DESC;
+      const bytes = new Uint8Array(await f.slice(0, need).arrayBuffer());
+      if (bytes.length < need) return { bad: 'This file is too small to be a firmware image.' };
+      const view = new DataView(bytes.buffer);
+      if (view.getUint8(0) !== 0xE9) return { bad: 'This is not an ESP firmware image.' };
+      if (view.getUint16(12, true) !== 9) return { bad: 'This image is not for the ESP32-S3.' };
+      const load = view.getUint32(HEADER, true);
+      const magic = view.getUint32(HEADER + SEGMENT, true);
+      if (load < 0x3C000000 || load >= 0x3E000000 || magic !== 0xABCD5432) {
+        return { bad: 'This is not an application image. A merged or full-flash image '
+          + 'holds the bootloader too: choose the plain .bin, such as snapclient.bin, not *-merged.bin.' };
+      }
+      const desc = HEADER + SEGMENT;
+      // app_elf_sha256, filled in when the image is made; zeros: unknown
+      const hash = Array.from(bytes.subarray(desc + 144, desc + 176), b => b.toString(16).padStart(2, '0')).join('');
+      return {
+        version: cString(bytes, desc + 16, 32),
+        project: cString(bytes, desc + 48, 32),
+        time: cString(bytes, desc + 80, 16),
+        date: cString(bytes, desc + 96, 16),
+        idf: cString(bytes, desc + 112, 32),
+        sha: /^0+$/.test(hash) ? '' : hash,
+      };
+    }
+
+    // an IPv4 address, or an IPv6 one ([...] in a URL)
+    function isIpHost(host) {
+      return /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':') || host.startsWith('[');
+    }
+
+    function imageBuilt(img) {
+      return `${img.date} ${img.time}`;
+    }
+
+    // "Nov 10 2026 17:55:06" (__DATE__ __TIME__) as a number to compare
+    function builtValue(text) {
+      const m = /^([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{4})\s+(\d{2}):(\d{2}):(\d{2})$/.exec(String(text || '').trim());
+      if (!m) return null;
+      const month = 'JanFebMarAprMayJunJulAugSepOctNovDec'.indexOf(m[1]) / 3;
+      if (month < 0 || month % 1 !== 0) return null;
+      return Date.UTC(+m[3], month, +m[2], +m[4], +m[5], +m[6]);
+    }
+
+    // the same build: by ELF hash when both have one (an incremental build
+    // keeps the version and build time), else by version and build time
+    function sameBuild(img, dev) {
+      if (!dev) return false;
+      if (has(img.sha) && has(dev.elf_sha256)) return img.sha === dev.elf_sha256;
+      return img.version === dev.firmware && imageBuilt(img) === dev.built;
+    }
+
+    function megabytes(bytes) {
+      if (bytes < 1024) return `${bytes} bytes`;
+      if (bytes < 1048576) return `${Math.round(bytes / 1024)} KB`;
+      return `${(bytes / 1048576).toLocaleString('en', { maximumFractionDigits: 2 })} MB`;
+    }
+
+    function show(id, on) {
+      $(id).hidden = !on;
+    }
+
+    function setText(id, text) {
+      const el = $(id);
+      el.textContent = text || '';
+      el.hidden = !text;
+    }
+
+    // which part of the update block shows: pick, check or run
+    function showPart(part) {
+      show('update-pick', part === 'pick');
+      show('update-check', part === 'check');
+      show('update-run', part === 'run');
+    }
+
+    function renderUpdate(dev) {
+      // needs rescue mode in the build, and a second slot to write to
+      const possible = dev.rescue_mode === true && has(dev.update_slot);
+      if (!busy && !inRescue && !watch) {
+        show('update', possible);
+      }
+      if (watch) watchInstall(dev);
+    }
+
+    async function chooseFile(f) {
+      file = f;
+      image = null;
+      if (!f) {
+        showPart('pick');
+        return;
+      }
+      setText('update-bad', '');
+      setText('update-warn', '');
+      showPart('check');
+      let info;
+      try {
+        info = await readImage(f);
+      } catch (error) {
+        info = { bad: "Couldn't read this file." };
+      }
+      if (file !== f) return;  // another file was chosen meanwhile
+      const rows = [
+        ['File', `${f.name}, ${megabytes(f.size)}`],
+      ];
+      const warn = [];
+      let bad = info.bad || null;
+      if (!bad) {
+        image = info;
+        rows.push(['Contains', `${info.project || 'unnamed'} ${info.version}`.trim()]);
+        rows.push(['Built', `${imageBuilt(info)}${has(info.idf) ? `, ESP-IDF ${info.idf}` : ''}`]);
+        const dev = device || {};
+        if (has(dev.update_slot)) rows.push(['Installs into', dev.update_slot]);
+        if (has(dev.update_slot_size) && f.size > dev.update_slot_size) {
+          bad = `This image is ${megabytes(f.size)}; the slot holds only ${megabytes(dev.update_slot_size)}.`;
+        }
+        if (info.project !== 'snapclient') {
+          warn.push(`This is ${info.project || 'an unnamed app'}, not snapclient. Once it's installed, `
+            + "these settings pages are gone; use that firmware's own page.");
+        }
+        if (sameBuild(info, dev)) {
+          warn.push('This is the build that runs now. Installing it again only fills the other slot.');
+        } else {
+          const a = builtValue(imageBuilt(info));
+          const b = builtValue(dev.built);
+          if (a !== null && b !== null && a < b) {
+            warn.push(`This build is older than the one running now (${dev.built}).`);
+          }
+        }
+      }
+      renderRowsInto($('rows-update'), rows, null);
+      setText('update-bad', bad);
+      setText('update-warn', warn.join(' '));
+      // rescue mode has no mDNS and gives the router no name: a page opened
+      // by name can lose the device until it's back in normal operation
+      const dev = device || {};
+      const byName = !bad && !inRescue && !isIpHost(location.hostname) && has(dev.ip);
+      $('update-host').hidden = !byName;
+      if (byName) {
+        $('update-host-text').textContent = `Rescue mode doesn't answer to the name ${location.hostname}, `
+          + 'only to the IP address, so this page could lose the device on the way.';
+        $('update-host-link').href = `http://${dev.ip}/#system`;
+      }
+      $('update-install').hidden = !!bad;
+      $('update-install-hint').hidden = !!bad;
+      $('update-install').textContent = inRescue || poller.inRescue ? 'Install' : 'Restart and install';
+    }
+
+    function setStep(name, state) {
+      const li = document.querySelector(`#update-steps li[data-step="${name}"]`);
+      li.classList.remove('active', 'done', 'failed');
+      if (state) li.classList.add(state);
+    }
+
+    function resetSteps() {
+      for (const li of document.querySelectorAll('#update-steps li')) li.className = '';
+      $('update-progress').value = 0;
+      $('update-progress').hidden = true;
+      setText('update-pct', '');
+    }
+
+    function setMessage(text, kind = 'info') {
+      const el = $('update-msg');
+      el.className = kind;
+      setText('update-msg', text);
+    }
+
+    // after the run: which buttons
+    function finish({ again = false, leave = false, close = false }) {
+      show('update-again', again);
+      show('update-leave', leave);
+      show('update-close', close);
+      show('update-after', again || leave || close);
+    }
+
+    function sleep(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    // GET /api/status until accept(reply) gives a value or time runs out.
+    // onDown() runs when a request fails (the device is restarting).
+    async function waitFor(accept, timeoutMs, onDown = null) {
+      const until = Date.now() + timeoutMs;
+      while (Date.now() < until) {
+        try {
+          const r = await fetchJson('/api/status', {}, 3000);
+          if (r.ok && r.body) {
+            const v = accept(r.body);
+            if (v) return v;
+          }
+        } catch (error) {
+          if (onDown) onDown();
+        }
+        await sleep(WAIT_POLL_MS);
+      }
+      return null;
+    }
+
+    // POST the file to rescue mode's /api/update, with progress
+    function sendFile(f, onProgress) {
+      return new Promise(resolve => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/update');
+        xhr.setRequestHeader('X-Web-Rescue', '1');
+        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+        xhr.timeout = UPLOAD_TIMEOUT_MS;
+        xhr.upload.onprogress = e => {
+          if (e.lengthComputable && e.total > 0) onProgress(e.loaded / e.total);
+        };
+        xhr.upload.onload = () => onProgress(1);
+        xhr.onload = () => {
+          let body = null;
+          try {
+            body = JSON.parse(xhr.responseText);
+          } catch (e) {
+            body = null;
+          }
+          resolve({
+            status: xhr.status,
+            ok: xhr.status === 200 && !!body && body.ok === true,
+            msg: body && typeof body.msg === 'string' ? body.msg
+              : (xhr.responseText || '').slice(0, 200),
+          });
+        };
+        xhr.onerror = () => resolve({ status: 0, ok: false, msg: null });
+        xhr.ontimeout = () => resolve({ status: 0, ok: false, msg: null, timeout: true });
+        xhr.send(f);
+      });
+    }
+
+    async function install() {
+      if (!file || !image || busy) return;
+      const f = file;
+      const img = image;
+      // the device went into rescue mode by itself (button, crashes): the
+      // file can go straight there
+      if (poller.inRescue) inRescue = true;
+      if (!inRescue) {
+        const what = sameBuild(img, device) ? 'the same build again' : `${img.project} ${img.version}`;
+        if (!confirm(`Install ${what}? All audio stops for about a minute while the device restarts twice.`)) return;
+      }
+      busy = true;
+      watch = null;  // a new run: an earlier install's watch is over
+      poller.stop();
+      showPart('run');
+      resetSteps();
+      finish({});
+      setMessage('');
+      if (!inRescue) {
+        before = device ? {
+          firmware: device.firmware, built: device.built, slot: device.slot, elf_sha256: device.elf_sha256,
+        } : null;
+      }
+
+      // 1. rescue mode
+      setStep('rescue', 'active');
+      let rescue = null;
+      if (inRescue) {
+        // still there? It goes back to normal after 10 idle minutes.
+        const now = await waitFor(st => isRescueStatus(st) ? { rescue: st }
+          : st.device ? { normal: st } : null, 15000);
+        rescue = now && now.rescue ? now.rescue : null;
+        if (!rescue) inRescue = false;
+      }
+      if (!rescue) {
+        let r = null;
+        try {
+          r = await fetchJson('/api/rescue', { method: 'POST', headers: { 'X-Web-Rescue': '1' } });
+        } catch (error) {
+          r = null;
+        }
+        // 404: rescue mode has no /api/rescue, so it's likely there already
+        if (!r || (!r.ok && r.status !== 404)) {
+          setStep('rescue', 'failed');
+          setMessage(r && r.status === 403
+            ? 'The device refused: open this page by its IP address or a local name.'
+            : r ? `The device answered HTTP ${r.status}. Nothing was changed.`
+              : "Couldn't reach the device. Nothing was changed.", 'error');
+          return stopRun({ again: true, close: true }, false);
+        }
+        setMessage(r.ok ? 'Restarting into rescue mode…' : 'Looking for rescue mode…');
+        rescue = await waitFor(st => isRescueStatus(st) ? st : null,
+          r.ok ? RESCUE_WAIT_MS : 15000);
+      }
+      if (!rescue) {
+        setStep('rescue', 'failed');
+        setMessage('The device did not come back in rescue mode within 2 minutes. If its light '
+          + 'blinks cyan, it is in rescue mode but not on your network: join its WiFi '
+          + '(snapclient-…) and open http://192.168.4.1 to install from there. Otherwise '
+          + 'it may have gone back to normal: reload this page.', 'error');
+        return stopRun({ close: true }, false);
+      }
+      inRescue = true;
+      setStep('rescue', 'done');
+      if (!has(rescue.next_update)) {
+        setMessage('Rescue mode has no other slot to write to.', 'error');
+        return stopRun({ leave: true }, true);
+      }
+      if (rescue.next_update_size > 0 && f.size > rescue.next_update_size) {
+        setMessage(`This image is ${megabytes(f.size)}; slot ${rescue.next_update} holds only `
+          + `${megabytes(rescue.next_update_size)}.`, 'error');
+        return stopRun({ again: true, leave: true }, true);
+      }
+
+      // 2. send the file
+      setStep('upload', 'active');
+      setMessage(`Sending ${f.name} to slot ${rescue.next_update}…`);
+      $('update-progress').hidden = false;
+      const sent = await sendFile(f, p => {
+        $('update-progress').value = p;
+        setText('update-pct', `${Math.floor(p * 100)} %`);
+        // the browser counts what it handed to the network, which runs
+        // ahead of what the device has written
+        if (p >= 1) {
+          setStep('upload', 'done');
+          setStep('install', 'active');
+          setMessage('Sent. The device is writing the file and checking it…');
+        }
+      });
+      if (!sent.ok) {
+        const stage = $('update-progress').value >= 1 ? 'install' : 'upload';
+        setStep(stage, 'failed');
+        setMessage(sent.msg
+          ? `Not installed: ${sent.msg}. The device is still in rescue mode; the running firmware is unchanged.`
+          : sent.timeout
+            ? 'The upload took too long and was stopped. The device is still in rescue mode; the running firmware is unchanged.'
+            : 'The upload was cut off. Nothing was installed; the device should still be in rescue mode.',
+          'error');
+        return stopRun({ again: true, leave: true }, true);
+      }
+      setStep('upload', 'done');
+      setStep('install', 'done');
+
+      // 3. the new firmware
+      inRescue = false;
+      setStep('check', 'active');
+      setMessage('Installed. Restarting into the new firmware…');
+      let wentDown = false;
+      const back = await waitFor(st => {
+        // rescue mode answers for another moment after the upload
+        if (isRescueStatus(st)) return wentDown ? st : null;
+        return st.device ? st : null;
+      }, BOOT_WAIT_MS, () => { wentDown = true; });
+      if (!back) {
+        setStep('check', 'failed');
+        setMessage('The device has not come back within 3 minutes. Wait a little and reload this '
+          + 'page. If its light blinks cyan, it is in rescue mode: open its setup page.', 'error');
+        return stopRun({ close: true }, false);
+      }
+      if (isRescueStatus(back)) {
+        inRescue = true;
+        setStep('check', 'failed');
+        setMessage('The device came back in rescue mode instead of the new firmware.', 'error');
+        return stopRun({ again: true, leave: true }, true);
+      }
+      device = back.device;
+      checkRunning(img, back.device, rescue.next_update);
+      busy = false;
+      poller.start();
+    }
+
+    // which build came up after the install
+    function checkRunning(img, dev, slot) {
+      if (sameBuild(img, dev) && (!has(slot) || dev.slot === slot)) {
+        setStep('check', 'done');
+        // "pending-verify": the bootloader goes back if it crashes before it
+        // confirms itself. Still "new": a bootloader without rollback (the
+        // vendor's, on boards updated over the web only).
+        const rollback = dev.ota_state === 'pending-verify';
+        watch = { image: img, slot: dev.slot, rollback, until: Date.now() + WATCH_MS };
+        const previous = before && has(before.slot) ? before.slot : 'the other slot';
+        setMessage(`Installed: ${img.project} ${img.version} runs from ${dev.slot}. It confirms itself `
+          + 'after a minute on the network. ' + (rollback
+            ? 'If it crashes before that, the device goes back to the previous firmware.'
+            : "This device's bootloader doesn't go back by itself: if the new firmware keeps "
+              + 'crashing, the device opens rescue mode after three crashes in a row, and its setup '
+              + `page can start ${previous} again.`), 'success');
+        finish({ close: true });
+        watchInstall(dev);
+        return;
+      }
+      setStep('check', 'failed');
+      if (before && dev.slot === before.slot && (has(before.elf_sha256) && has(dev.elf_sha256)
+        ? dev.elf_sha256 === before.elf_sha256
+        : dev.firmware === before.firmware && dev.built === before.built)) {
+        setMessage(`The new firmware did not start, so the device went back to the previous one `
+          + `(${dev.firmware}, ${dev.slot}). Last restart: ${dev.reset_reason || 'unknown'}. `
+          + 'See Recent events below.', 'error');
+      } else {
+        setMessage(`The device runs ${dev.firmware || 'unknown firmware'} (${dev.built || '?'}) from `
+          + `${dev.slot || '?'}, not the file's ${img.version} (${imageBuilt(img)}).`, 'error');
+      }
+      watch = null;
+      finish({ close: true });
+    }
+
+    // the first minute or two after an install: a crash before the firmware
+    // confirms itself rolls it back
+    function watchInstall(dev) {
+      if (!watch) return;
+      if (dev.slot !== watch.slot || !sameBuild(watch.image, dev)) {
+        const rollback = watch.rollback;
+        watch = null;
+        // shown even if Done was clicked meanwhile
+        show('update', true);
+        showPart('run');
+        setStep('check', 'failed');
+        setMessage((rollback
+          ? 'The new firmware restarted before it was confirmed, so the device went back to '
+          : 'The new firmware no longer runs: the device now runs ')
+          + `${dev.firmware} (${dev.slot}). Last restart: ${dev.reset_reason || 'unknown'}. `
+          + 'See Recent events below.', 'error');
+        finish({ close: true });
+        return;
+      }
+      if (dev.ota_state === 'valid') {
+        if (!$('update-run').hidden) {
+          setMessage(`Installed and confirmed: ${watch.image.project} ${watch.image.version} runs from `
+            + `${dev.slot}.`, 'success');
+        }
+        watch = null;
+      } else if (Date.now() > watch.until) {
+        watch = null;
+      }
+    }
+
+    // end of a run that needs the user: buttons, and polling again unless
+    // the device stays in rescue mode (its /api/status keeps it there)
+    function stopRun(buttons, staysInRescue) {
+      inRescue = staysInRescue;
+      busy = false;
+      $('update-progress').hidden = true;
+      finish(buttons);
+      if (!staysInRescue) poller.start();
+    }
+
+    async function leaveRescue() {
+      busy = true;
+      finish({});
+      setMessage('Restarting into normal operation…');
+      try {
+        await fetchJson('/api/reboot', { method: 'POST', headers: { 'X-Web-Rescue': '1' } });
+      } catch (error) {
+        // it may already be on its way
+      }
+      let wentDown = false;
+      const back = await waitFor(st => {
+        if (isRescueStatus(st)) return wentDown ? st : null;
+        return st.device ? st : null;
+      }, BOOT_WAIT_MS, () => { wentDown = true; });
+      busy = false;
+      if (back && back.device) {
+        inRescue = false;
+        setMessage(`Back to normal, running ${back.device.firmware} from ${back.device.slot}.`, 'success');
+        finish({ close: true });
+        poller.start();
+      } else {
+        setMessage("The device hasn't come back yet. Wait a little and reload this page.", 'error');
+        inRescue = false;
+        finish({ close: true });
+        poller.start();
+      }
+    }
+
+    function closeUpdate() {
+      file = null;
+      image = null;
+      $('update-file').value = '';
+      showPart('pick');
+      finish({});
+      setMessage('');
+      if (device) renderUpdate(device);
+    }
+
+    $('update-choose').addEventListener('click', () => $('update-file').click());
+    $('update-file').addEventListener('change', e => chooseFile(e.target.files && e.target.files[0]));
+    $('update-cancel').addEventListener('click', () => {
+      if (inRescue) {
+        // back to the run's buttons
+        showPart('run');
+        return;
+      }
+      closeUpdate();
+    });
+    $('update-install').addEventListener('click', install);
+    $('update-again').addEventListener('click', () => {
+      $('update-file').value = '';
+      $('update-file').click();
+    });
+    $('update-leave').addEventListener('click', leaveRescue);
+    $('update-close').addEventListener('click', closeUpdate);
+
+    // the tab bar asks before leaving this tab (index.html), and the browser
+    // before closing the page
+    window.pageBusy = () => busy
+      ? 'A firmware update is under way; leaving this tab stops it.'
+      : inRescue ? 'The device is waiting in rescue mode for a firmware file.' : null;
+    window.addEventListener('beforeunload', e => {
+      if (busy && !window.leaveConfirmed) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    });
+
+    // ---- rendering ----
+
+    function render(st) {
+      const dev = st.device || null;
+      device = dev;
+      renderCard('device', DEVICE_ROWS, dev);
+      if (dev) {
+        const pending = dev.ota_state === 'pending-verify' || dev.ota_state === 'new';
+        $('badge-device').hidden = !pending;
+        if (pending) setBadge('badge-device', 'new firmware', 'warn');
+        renderUpdate(dev);
+      }
+      renderWifi(st);
+      updateEvents(st);
+    }
+
+    const poller = new StatusPoller(render, showReachability);
+
+    if (liveDataBlocked()) {
+      const offline = $('offline');
+      offline.textContent = 'The System tab only works on the page the device itself serves.';
+      offline.style.display = 'block';
+    } else {
+      poller.start();
+    }
+  </script>
+</body>
+</html>

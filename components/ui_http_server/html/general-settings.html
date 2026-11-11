@@ -6,7 +6,12 @@
   <title>General Settings</title>
   <link rel="stylesheet" href="styles.css">
   <script src="index.js"></script>
+  <script src="status-common.js"></script>
   <style>
+    [hidden] {
+      display: none !important;
+    }
+
     body {
       font-family: Arial, sans-serif;
       max-width: 800px;
@@ -166,6 +171,97 @@
       padding: 0; /* inner control uses outer padding */
       background: transparent;
     }
+
+    /* Sendspin pairing: live state from /api/status */
+    #sendspin-pairing {
+      margin-top: 20px;
+      color: #333;
+    }
+
+    #sendspin-pairing.stale {
+      opacity: 0.55;
+    }
+
+    #sendspin-pairing .pair-title {
+      font-weight: bold;
+      margin-bottom: 10px;
+      font-size: 16px;
+    }
+
+    #sendspin-pairing .warning {
+      margin: 0 0 12px 0;
+      padding: 10px 12px;
+      font-size: 14px;
+    }
+
+    #sendspin-pairing dl {
+      display: grid;
+      grid-template-columns: minmax(130px, 34%) 1fr;
+      gap: 6px 16px;
+      margin: 0;
+      font-size: 14px;
+    }
+
+    #sendspin-pairing dt {
+      color: #666;
+    }
+
+    #sendspin-pairing dd {
+      margin: 0;
+      overflow-wrap: anywhere;
+      white-space: pre-line;  /* one paired server per line */
+    }
+
+    #sendspin-pairing dd.code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 18px;
+      letter-spacing: 0.08em;
+    }
+
+    #sendspin-pairing .actions {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    #sendspin-pairing .hint {
+      color: #888;
+      font-size: 12px;
+      margin-top: 12px;
+    }
+
+    /* a label, but not a setting title (.setting-control label) */
+    #sendspin-pairing .switch-row {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 14px 0 0 0;
+      font-size: 14px;
+      font-weight: normal;
+    }
+
+    #sendspin-pairing .switch-row .hint {
+      margin-top: 0;
+    }
+
+    #sendspin-pairing.highlight {
+      box-shadow: 0 0 0 3px rgba(0,123,255,0.35);
+      transition: box-shadow 0.6s;
+    }
+
+    @media (max-width: 480px) {
+      #sendspin-pairing dl {
+        grid-template-columns: 1fr;
+        gap: 2px;
+      }
+
+      #sendspin-pairing dd {
+        margin-bottom: 8px;
+      }
+    }
   </style>
 </head>
 <body>
@@ -173,6 +269,34 @@
   
   <div id="app">
     <div class="loading">Loading settings...</div>
+  </div>
+
+  <div class="warning" id="pair-wrong-host" role="status" hidden></div>
+
+  <div class="setting-control setting-section" id="sendspin-pairing" hidden>
+    <div class="pair-title">Sendspin pairing</div>
+    <div class="description">Which Sendspin servers (Music Assistant) may play on
+      this device. Changes here apply at once; only Forget paired servers
+      restarts the device.</div>
+    <div class="warning" id="pair-prompt" role="status" hidden></div>
+    <dl id="rows-pairing"></dl>
+    <div class="actions">
+      <button class="btn btn-primary" id="pair-allow" type="button">Allow pairing for 5 minutes</button>
+      <button class="btn btn-secondary" id="pair-stop" type="button" hidden>Stop pairing</button>
+      <button class="btn btn-danger" id="pair-forget" type="button" hidden>Forget paired servers</button>
+    </div>
+    <label class="switch-row">
+      <input type="checkbox" id="require-pairing">
+      Require pairing (refuse servers that have not paired)
+      <span class="hint" id="require-from"></span>
+    </label>
+    <div class="hint" id="pair-note" role="status"></div>
+    <div class="hint">To pair Music Assistant: open Settings &rarr; Players
+      &rarr; this player &rarr; Reconfigure player. When it asks to put the
+      device in pairing mode, press the device button briefly (the light
+      turns violet) or Allow pairing here, then type the code. Pair it
+      before requiring pairing: a refused Music Assistant does not come back
+      by itself.</div>
   </div>
 
   <script>
@@ -207,6 +331,8 @@
       } catch (error) {
         console.error('Error loading settings:', error);
         showError('Error loading settings. Please refresh the page.', app);
+        settingsShown = true;
+        maybeScrollToPairing();
       }
     }
 
@@ -256,11 +382,13 @@
       
       // Info message
       html += '<div class="info">';
-      html += '<strong>Note:</strong> After changing the settings, you will need to restart the device for the changes to take effect.';
+      html += '<strong>Note:</strong> After changing the hostname or the Snapserver settings, you will need to restart the device for the changes to take effect.';
       html += '</div>';
       
       app.innerHTML = html;
       updateRestartButton();
+      settingsShown = true;
+      maybeScrollToPairing();
     }
 
     // Handle snapserver mDNS selection change
@@ -519,6 +647,165 @@
 
     // Initialize on page load
     document.addEventListener('DOMContentLoaded', loadSettings);
+
+    // ---- Sendspin pairing: live state from /api/status, every 2 s while
+    // this tab is open ----
+
+    let pairing = null;    // the latest pairing state
+    let lastSendspin = null;
+    let pairBusy = false;  // an action is on its way: leave the switch alone
+    let pairScrolled = false;
+    let settingsShown = false;  // the settings above it are in place
+
+    // opened from the Status tab's "Open pairing": scroll to the block once
+    // it and the settings above it have rendered (they push it down)
+    function maybeScrollToPairing() {
+      const box = document.getElementById('sendspin-pairing');
+      if (pairScrolled || !settingsShown || box.hidden || location.hash !== '#sendspin-pairing') return;
+      pairScrolled = true;
+      box.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      box.classList.add('highlight');
+      setTimeout(() => box.classList.remove('highlight'), 2500);
+    }
+
+    function renderPairing(st) {
+      const ss = st.sendspin;
+      const box = document.getElementById('sendspin-pairing');
+      const p = ss && ss.running !== false ? ss.pairing : null;
+      pairing = p || null;
+      lastSendspin = ss || null;
+      if (!p) {
+        box.hidden = true;
+        return;
+      }
+      box.hidden = false;
+
+      const server = p.server || 'The server';
+      const prompt = document.getElementById('pair-prompt');
+      if (p.waiting) {
+        prompt.textContent = `${server} asks to pair. Press the device button briefly, or Allow pairing below.`;
+      } else if (p.pairing_now) {
+        prompt.textContent = `${server} is pairing: type the code ${p.code || ''} in it.`;
+      }
+      prompt.hidden = !p.waiting && !p.pairing_now;
+
+      const paired = Array.isArray(p.paired) ? p.paired : [];
+      renderRowsInto(document.getElementById('rows-pairing'), [
+        ['Code', p.code || 'none', 'code'],
+        ['Unpaired servers', p.required
+          ? 'refused: only paired servers may play'
+          : 'allowed: any server on the network may play'],
+        ['Pairing window', p.window_open
+          ? `open, about ${mmss((p.window_left_s || 0) * 1000)} left${has(p.window_for) ? ` (for ${p.window_for})` : ''}`
+          : 'closed'],
+        ['Paired servers', paired.length
+          ? paired.map(e => `${e.name || `server ${e.id}…`}${e.connected ? ' (connected)' : ''}`).join('\n')
+          : 'none'],
+      ], null);
+
+      // a new gesture during an attempt is ignored by the board
+      const allow = document.getElementById('pair-allow');
+      allow.hidden = !!p.pairing_now;
+      allow.textContent = p.waiting
+        ? 'Allow pairing'
+        : p.window_open ? 'Allow 5 more minutes' : 'Allow pairing for 5 minutes';
+      // Stop can't end a pairing under way (the library lets it finish), but
+      // it closes the window, so a retry needs a new gesture
+      const stop = document.getElementById('pair-stop');
+      stop.hidden = !p.window_open && !p.waiting;
+      stop.textContent = p.waiting ? 'Refuse'
+        : p.pairing_now ? 'Close pairing window' : 'Stop pairing';
+      document.getElementById('pair-forget').hidden = paired.length === 0;
+      if (!pairBusy) {
+        document.getElementById('require-pairing').checked = !!p.required;
+      }
+      document.getElementById('require-from').textContent =
+        p.required_from === 'page' ? '(changed on this page)' : '(build setting)';
+
+      maybeScrollToPairing();
+    }
+
+    let pairNoteTimer = null;
+
+    function setPairNote(text) {
+      const note = document.getElementById('pair-note');
+      note.textContent = text;
+      clearTimeout(pairNoteTimer);
+      // the block shows the state; the note is only the button's answer
+      if (text) pairNoteTimer = setTimeout(() => { note.textContent = ''; }, 10000);
+    }
+
+    // failText: what to say when no answer came (default: couldn't reach it)
+    async function pairAction(name, done, failText = null) {
+      pairBusy = true;
+      document.querySelectorAll('#sendspin-pairing button, #sendspin-pairing input').forEach(el => { el.disabled = true; });
+      setPairNote('');
+      try {
+        if (!await statusAction(name)) {
+          setPairNote('Not now: Sendspin is not running or is busy. Try again.');
+        } else if (done) {
+          setPairNote(done);
+        }
+      } catch (error) {
+        setPairNote(failText || "Couldn't reach the device.");
+      }
+      // the Sendspin task applies it within a moment: show the result
+      setTimeout(() => {
+        document.querySelectorAll('#sendspin-pairing button, #sendspin-pairing input').forEach(el => { el.disabled = false; });
+        pairBusy = false;
+        pairPoller.soon();
+      }, 600);
+    }
+
+    document.getElementById('pair-allow').addEventListener('click', () =>
+      pairAction('sendspin-pair-allow', pairing && pairing.waiting
+        ? 'Pairing allowed: type the code in the server.'
+        : 'Pairing allowed: start it on the server now, then type the code.'));
+    document.getElementById('pair-stop').addEventListener('click', () =>
+      pairAction('sendspin-pair-stop', pairing && pairing.pairing_now
+        ? 'Window closed. The pairing under way can still finish if the code is typed in the server; it ends within 2 minutes.'
+        : ''));
+    document.getElementById('pair-forget').addEventListener('click', () => {
+      const n = pairing && Array.isArray(pairing.paired) ? pairing.paired.length : 0;
+      const msg = `Forget ${n === 1 ? 'the paired server' : `all ${n} paired servers`}? `
+        + 'They must pair again; while pairing is required they cannot play until then. '
+        + 'The device restarts for it: all audio stops for about 10 seconds.';
+      // the board answers before it restarts, so no answer is not success
+      if (confirm(msg)) pairAction('sendspin-forget-paired', 'Forgotten. The device is restarting…',
+        'No answer from the device. Check the paired servers once it is back.');
+    });
+    document.getElementById('require-pairing').addEventListener('change', event => {
+      const on = event.target.checked;
+      if (on && pairing) {
+        const paired = Array.isArray(pairing.paired) ? pairing.paired : [];
+        let warn = null;
+        if (paired.length === 0) {
+          warn = 'No server has paired yet: every server, Music Assistant included, '
+            + 'will be refused until one pairs. Require pairing anyway?';
+        } else if (lastSendspin && lastSendspin.connected && lastSendspin.paired === false) {
+          warn = `${lastSendspin.server_name || 'The connected server'} has not paired: it will be `
+            + 'disconnected, and Music Assistant does not reconnect by itself. Require pairing anyway?';
+        }
+        if (warn && !confirm(warn)) {
+          event.target.checked = false;
+          return;
+        }
+      }
+      pairAction(on ? 'sendspin-require-pairing' : 'sendspin-allow-unpaired', '');
+    });
+
+    const pairPoller = new StatusPoller(renderPairing, state => {
+      document.getElementById('sendspin-pairing').classList.toggle('stale', state.stale);
+      // /api/status answers only to the device's IP or a LAN name
+      const wrong = document.getElementById('pair-wrong-host');
+      wrong.textContent = state.wrongHost
+        ? 'Sendspin pairing shows only when this page is opened by the device\'s IP address '
+          + `or a local name (name.local, name.lan, …), not ${location.hostname}.`
+        : '';
+      wrong.hidden = !state.wrongHost;
+    });
+    // /api/status can't be read from a page served elsewhere (?backend=)
+    if (!liveDataBlocked()) pairPoller.start();
   </script>
 </body>
 </html>
