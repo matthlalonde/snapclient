@@ -28,6 +28,7 @@
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
 #include "lwip/tcp.h"
+#include "lwip/tcpip.h"
 #include "mdns.h"
 #include "net_functions.h"
 #include "network_interface.h"
@@ -84,6 +85,7 @@ static bool spdif_i2s_clock_cb(player_i2s_event_t event, uint32_t sample_rate,
 #include "snapcast_protocol_parser.h"
 #include "event_log.h"
 #include "snapcast_status.h"
+#include "snapserver_rename.h"
 #include "status_sections.h"
 #include "ui_http_server.h"
 #if CONFIG_DAC_TAS5805M
@@ -119,6 +121,12 @@ const char *VERSION_STRING = "0.0.4";
 
 TaskHandle_t t_ota_task = NULL;
 TaskHandle_t t_http_get_task = NULL;
+// set when a restart begins (snapcast_shutdown_handler): setup_network() then
+// stays off the network. The mux guards it together with t_http_get_task, so
+// the restart and ota_server.c's task delete can't overlap.
+volatile bool snapcast_stopping = false;
+portMUX_TYPE snapcast_task_mux = portMUX_INITIALIZER_UNLOCKED;
+static SemaphoreHandle_t s_abort_done;  // given by snapcast_abort_cb
 
 #define FAST_SYNC_LATENCY_BUF 10000      // in µs
 #define NORMAL_SYNC_LATENCY_BUF 1000000  // in µs
@@ -1152,7 +1160,7 @@ static void http_get_task(void *pvParameters) {
   base_message_t base_message_rx;
   hello_message_t hello_message;
   char *hello_message_serialized = NULL;
-  static char device_hostname[64] = {0};  // Buffer for hostname
+  static char snapcast_name[64] = {0};  // the Hello's HostName
   int result;
   time_sync_data_t time_sync_data;
   time_sync_data.lastTimeSync = 0;
@@ -1173,6 +1181,10 @@ static void http_get_task(void *pvParameters) {
   }
 
   while (1) {
+    // after the restart handler's RST: wait for the reset here, before the
+    // housekeeping logs a lost connection
+    park_if_stopping();
+
     // do some house keeping
     {
       status_led_set_server_connected(false);
@@ -1255,12 +1267,14 @@ static void http_get_task(void *pvParameters) {
     // init hello message
     hello_message.mac = mac_address;
 
-    // Get hostname from NVS or fallback to a sensible default
-    if (settings_get_hostname(device_hostname, sizeof(device_hostname)) !=
-        ESP_OK) {
-      strncpy(device_hostname, "snapclient", sizeof(device_hostname) - 1);
+    // the snapcast name (the hostname unless one is saved), re-read on every
+    // reconnect; the server shows it unless a name is saved there
+    if (settings_get_snapcast_display_name(snapcast_name,
+                                           sizeof(snapcast_name)) != ESP_OK ||
+        snapcast_name[0] == '\0') {
+      strncpy(snapcast_name, "snapclient", sizeof(snapcast_name) - 1);
     }
-    hello_message.hostname = device_hostname;
+    hello_message.hostname = snapcast_name;
 
     hello_message.version = (char *)VERSION_STRING;
     hello_message.client_name = "libsnapcast";
@@ -1307,6 +1321,16 @@ static void http_get_task(void *pvParameters) {
     ESP_LOGI(TAG, "netconn sent hello message");
     status_led_set_server_connected(true);
     snapcast_status_set_connected(true);
+
+    // a name saved on the server wins over HostName: after a new snapcast
+    // name, set it there too, once per boot, on its own task
+    static bool rename_tried = false;
+    if (!rename_tried && strcmp(snapserver_rename_state(), "pending") == 0) {
+      rename_tried = true;
+      snapcast_status_t sc;
+      snapcast_status_get(&sc);
+      snapserver_rename_start(sc.server_ip, mac_address, snapcast_name);
+    }
 
     // init default setting
     scSet.buf_ms = 500;
@@ -1391,6 +1415,44 @@ static void dac_control_task(audio_board_handle_t board_handle,
       status_led_set_playing(dac_data.enabled && !dac_data.mute);
       dac_data_old = dac_data;
     }
+  }
+}
+
+// Runs on lwIP's own task: reset the snapcast connection (a TCP RST), so the
+// snapserver drops this client at once. lwipNetconn is read here, not by the
+// caller: setup_network() clears it, then closes the netconn through this
+// same task before freeing it, so a pointer seen here is still a live netconn.
+static void snapcast_abort_cb(void *arg) {
+  struct netconn *conn = lwipNetconn;
+  if (conn != NULL && NETCONNTYPE_GROUP(netconn_type(conn)) == NETCONN_TCP &&
+      conn->pcb.tcp != NULL) {
+    tcp_abort(conn->pcb.tcp);  // lwIP then tells the netconn, as for a RST
+  }
+  xSemaphoreGive((SemaphoreHandle_t)arg);
+}
+
+// Called by esp_restart() before WiFi stops. A reset closes no connection, so
+// without this the snapserver lists the board as connected until it next
+// sends it audio, which never ends while snapcast is off after the restart.
+// Best effort: waits about 100 ms at most. It never suspends the snapcast
+// task, which could freeze it holding an lwIP lock and hang the restart; the
+// flag parks it in setup_network() instead.
+static void snapcast_shutdown_handler(void) {
+  portENTER_CRITICAL(&snapcast_task_mux);
+  bool first = t_http_get_task != NULL && !snapcast_stopping;
+  if (first) snapcast_stopping = true;
+  portEXIT_CRITICAL(&snapcast_task_mux);
+  if (!first) return;  // no snapcast task (off, or deleted for OTA), or done
+
+  // the try variant never blocks (this may run on lwIP's own task); a full
+  // queue gets a few short retries
+  for (int i = 0; i < 4; i++) {
+    if (tcpip_try_callback(snapcast_abort_cb, s_abort_done) == ERR_OK) {
+      xSemaphoreTake(s_abort_done, pdMS_TO_TICKS(50));
+      vTaskDelay(pdMS_TO_TICKS(50));  // let WiFi send the RST
+      return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
@@ -1622,6 +1684,39 @@ void app_main(void) {
   }
   ESP_LOGI(TAG, "Device hostname: %s", mdns_hostname);
   
+  // which players run this boot and the names they show (the hostname
+  // unless one is saved); General Settings changes apply after a restart
+  bool snapcast_on = true;
+  bool sendspin_on = true;
+  if (settings_get_snapcast_enabled(&snapcast_on) != ESP_OK) {
+    snapcast_on = true;
+  }
+  if (settings_get_sendspin_enabled(&sendspin_on) != ESP_OK) {
+    sendspin_on = true;
+  }
+  char snapcast_name[64] = {0};
+  char sendspin_name[64] = {0};
+  if (settings_get_snapcast_display_name(snapcast_name,
+                                         sizeof(snapcast_name)) != ESP_OK ||
+      snapcast_name[0] == '\0') {
+    snprintf(snapcast_name, sizeof(snapcast_name), "%s", mdns_hostname);
+  }
+  if (settings_get_sendspin_display_name(sendspin_name,
+                                         sizeof(sendspin_name)) != ESP_OK ||
+      sendspin_name[0] == '\0') {
+    snprintf(sendspin_name, sizeof(sendspin_name), "%s", mdns_hostname);
+  }
+  ESP_LOGI(TAG, "snapcast %s as \"%s\", Sendspin %s as \"%s\"",
+           snapcast_on ? "on" : "off", snapcast_name,
+           sendspin_on ? "on" : "off", sendspin_name);
+  bool rename_pending = false;
+  if (snapcast_on &&
+      settings_get_snapcast_rename_pending(&rename_pending) == ESP_OK &&
+      rename_pending) {
+    // set on the snapserver after the first connection (http_get_task)
+    snapserver_rename_set_pending();
+  }
+
   #if CONFIG_ESP32_UDP_LOGGER_ENABLED
 //  esp32_udp_logger_set_hostname(mdns_hostname);
   esp32_udp_logger_autostart();
@@ -1629,7 +1724,13 @@ void app_main(void) {
 
   init_http_server_task();
   // live state for the settings page's Status and System tabs
-  status_sections_init(mdns_hostname);
+  status_sections_init(&(status_identity_t){
+      .hostname = mdns_hostname,
+      .snapcast_enabled = snapcast_on,
+      .snapcast_name = snapcast_name,
+      .sendspin_enabled = sendspin_on,
+      .sendspin_name = sendspin_name,
+  });
 
   // Enable websocket server
   //  ESP_LOGI(TAG, "Setup ws server");
@@ -1639,7 +1740,11 @@ void app_main(void) {
 #if CONFIG_SENDSPIN_PLAYER_ENABLE
   // Music Assistant's Sendspin; takes the I2S output from snapcast while
   // its streams play
-  sendspin_player_start(mdns_hostname);
+  if (sendspin_on) {
+    sendspin_player_start(sendspin_name);
+  } else {
+    ESP_LOGI(TAG, "Sendspin is off (General Settings)");
+  }
 #endif
 #ifdef CONFIG_SNAPCLIENT_SNTP_ENABLE
   set_time_from_sntp();
@@ -1659,9 +1764,23 @@ void app_main(void) {
                           OTA_TASK_PRIORITY, &t_ota_task, OTA_TASK_CORE_ID);
 #endif
 
-  xTaskCreatePinnedToCore(&http_get_task, "http", 15 * 1024, NULL,
-                          HTTP_TASK_PRIORITY, &t_http_get_task,
-                          HTTP_TASK_CORE_ID);
+  // the snapcast client; when it is off the player, DAC control and mDNS
+  // still run, as Sendspin uses them
+  if (snapcast_on) {
+    xTaskCreatePinnedToCore(&http_get_task, "http", 15 * 1024, NULL,
+                            HTTP_TASK_PRIORITY, &t_http_get_task,
+                            HTTP_TASK_CORE_ID);
+    // end the connection on every restart, so the snapserver sees it go
+    s_abort_done = xSemaphoreCreateBinary();
+    if (s_abort_done == NULL ||
+        esp_register_shutdown_handler(snapcast_shutdown_handler) != ESP_OK) {
+      ESP_LOGW(TAG, "can't end the snapcast connection on restarts");
+    }
+  } else {
+    ESP_LOGI(TAG, "snapcast is off (General Settings)");
+    event_log_add(EVENT_SRC_SNAPCAST, EVENT_INFO,
+                  "Snapcast is off (General Settings)");
+  }
 
   //  while (1) {
   //    // audio_event_iface_msg_t msg;

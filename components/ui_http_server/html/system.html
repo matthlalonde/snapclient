@@ -207,7 +207,7 @@
     };
 
     const DEVICE_ROWS = [
-      ['Name', s => s.name || null],
+      ['Hostname', s => s.name || null],
       ['Firmware', s => s.firmware || null],
       ['Built', s => has(s.built) ? (has(s.idf) ? `${s.built}, ESP-IDF ${s.idf}` : s.built) : null],
       ['Running from', s => {

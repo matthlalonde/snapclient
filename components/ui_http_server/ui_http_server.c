@@ -137,6 +137,89 @@ static esp_err_t send_400(httpd_req_t *req, const char *msg) {
 	return httpd_resp_sendstr(req, msg);
 }
 
+/* The guard for the live tabs' buttons and the player settings: the board's
+ * IP address or a LAN name only (a page on another site that points its own
+ * name at this board, DNS rebinding, is refused), plus the X-Status-Action
+ * header. Another site's page can't send that header, because the CORS
+ * answer (set_cors_headers) doesn't allow it. Answers 403 itself on refusal. */
+static bool action_allowed(httpd_req_t *req) {
+	if (!web_rescue_host_allowed(req)) return false;
+	char hdr[4];
+	if (httpd_req_get_hdr_value_str(req, "X-Status-Action", hdr, sizeof(hdr)) !=
+			ESP_OK ||
+		strcmp(hdr, "1") != 0) {
+		httpd_resp_set_status(req, "403 Forbidden");
+		httpd_resp_sendstr(req, "missing X-Status-Action header");
+		return false;
+	}
+	return true;
+}
+
+/* The player on/off flags and names, saved for the next boot */
+static bool is_player_param(const char *param) {
+	return strcmp(param, "snapcast_enabled") == 0 ||
+		   strcmp(param, "sendspin_enabled") == 0 ||
+		   strcmp(param, "snapcast_name") == 0 ||
+		   strcmp(param, "sendspin_name") == 0;
+}
+
+static esp_err_t player_param_post(httpd_req_t *req, const char *param,
+								   const char *valstr, bool has_value) {
+	if (!action_allowed(req)) return ESP_OK;
+	bool sendspin = strncmp(param, "sendspin_", 9) == 0;
+	bool is_name = strcmp(param, "snapcast_name") == 0 ||
+				   strcmp(param, "sendspin_name") == 0;
+#if !CONFIG_SENDSPIN_PLAYER_ENABLE
+	if (sendspin) return send_400(req, "Sendspin is not built in");
+#endif
+	if (!has_value) return send_400(req, "missing value");
+
+	esp_err_t err;
+	if (!is_name) {
+		if (strcmp(valstr, "0") != 0 && strcmp(valstr, "1") != 0)
+			return send_400(req, "value must be 0 or 1");
+		bool on = valstr[0] == '1';
+		ESP_LOGI(TAG, "%s: Setting %s to: %d", __func__, param, on ? 1 : 0);
+		err = sendspin ? settings_set_sendspin_enabled(on)
+					   : settings_set_snapcast_enabled(on);
+	} else {
+		// a bad or %00 escape would decode to a NUL and cut the name short
+		for (const char *p = strchr(valstr, '%'); p; p = strchr(p + 1, '%')) {
+			if (!isxdigit((unsigned char)p[1]) ||
+				!isxdigit((unsigned char)p[2]) || (p[1] == '0' && p[2] == '0'))
+				return send_400(req, "name: bad %-escape");
+		}
+		char name[64];
+		if (!url_decode(name, valstr, sizeof(name)))
+			return send_400(req, "name too long (63 bytes at most)");
+		if (name[0] != '\0' && !settings_name_valid(name))
+			return send_400(req, "name: no control characters, no leading or "
+								 "trailing spaces, valid UTF-8");
+		ESP_LOGI(TAG, "%s: Setting %s to: '%s'", __func__, param, name);
+		// "" erases: the player uses the hostname again
+		err = sendspin ? settings_set_sendspin_name(name)
+					   : settings_set_snapcast_name(name);
+		// the board sends its new snapcast name to the snapserver at the
+		// next boot
+		if (err == ESP_OK && !sendspin)
+			err = settings_set_snapcast_rename_pending(true);
+	}
+	if (err != ESP_OK) {
+		httpd_resp_set_status(req, "500 Internal Server Error");
+		return httpd_resp_sendstr(req, "could not save the setting");
+	}
+	httpd_resp_set_status(req, "200 OK");
+	return httpd_resp_sendstr(req, "ok");
+}
+
+/* While no snapcast name is saved, the snapcast name is the hostname: send a
+ * new hostname to the snapserver at the next boot too. */
+static void hostname_changed(void) {
+	char name[64] = "";
+	settings_get_snapcast_name(name, sizeof(name));  // "" on a read error
+	if (name[0] == '\0') settings_set_snapcast_rename_pending(true);
+}
+
 /**
  * Find key value in parameter string
  */
@@ -207,7 +290,7 @@ static esp_err_t root_post_handler(httpd_req_t *req) {
 	URL_t urlBuf;
 	int ret = -1;
 	char param[32] = {0};
-	char valstr[160] = {0};  // a URL-encoded host name (128 decoded)
+	char valstr[200] = {0};  // a URL-encoded 63-byte UTF-8 name (3 chars a byte)
 
 	set_cors_headers(req);
 
@@ -221,6 +304,9 @@ static esp_err_t root_post_handler(httpd_req_t *req) {
 	bool value_empty = vkey && (vkey[6] == '\0' || vkey[6] == '&');
 	if (!plen) return send_400(req, "missing or too long param");
 	if (vkey && !value_empty && !vlen) return send_400(req, "value too long");
+	// guarded, and every answer (an empty name too) comes from there
+	if (is_player_param(param))
+		return player_param_post(req, param, valstr, vkey != NULL);
 	// the settings page sends an empty host/port to clear them
 	if (value_empty && (strcmp(param, "snapserver_host") == 0 ||
 						strcmp(param, "snapserver_port") == 0)) {
@@ -247,6 +333,7 @@ static esp_err_t root_post_handler(httpd_req_t *req) {
 					 decoded_hostname);
 
 			if (settings_set_hostname(decoded_hostname) == ESP_OK) {
+				hostname_changed();
 				httpd_resp_set_status(req, "200 OK");
 				httpd_resp_sendstr(req, "ok");
 			} else {
@@ -356,6 +443,7 @@ static esp_err_t root_delete_handler(httpd_req_t *req) {
 	if (strcmp(param, "hostname") == 0) {
 		ESP_LOGI(TAG, "%s: Clearing hostname from NVS", __func__);
 		if (settings_clear_hostname() == ESP_OK) {
+			hostname_changed();
 			httpd_resp_set_status(req, "200 OK");
 			httpd_resp_sendstr(req, "ok");
 		} else {
@@ -567,7 +655,8 @@ static esp_err_t get_param_handler(httpd_req_t *req) {
  * /capabilities?tab=dsp
  *
  * Response for tab=general:
- * - hostname, mdns_enabled, server_host, server_port
+ * - hostname, mdns_enabled, server_host, server_port, the player flags and
+ *   names, and the build flags (see settings_get_json)
  *
  * Response for tab=dsp (if DSP enabled):
  * - active_flow and all flow parameters
@@ -591,13 +680,25 @@ static esp_err_t get_capabilities_handler(httpd_req_t *req) {
 	ESP_LOGI(TAG, "%s: Requested tab: %s", __func__, tab);
 
 	if (strcmp(tab, "general") == 0) {
-		// Return general settings
-		char general_json[512] = {0};
-		esp_err_t ret = settings_get_json(general_json, sizeof(general_json));
+		// Return general settings. On the heap: with both player names the
+		// JSON can pass 512 bytes, too much for the small httpd stack
+		const size_t general_size = 1024;
+		char *general_json = (char *)malloc(general_size);
+		if (!general_json) {
+			ESP_LOGE(TAG, "%s: Failed to allocate memory for general JSON",
+					 __func__);
+			httpd_resp_set_status(req, "500 Internal Server Error");
+			httpd_resp_sendstr(req,
+							   "{\"error\": \"Memory allocation failed\"}");
+			return ESP_OK;
+		}
+
+		esp_err_t ret = settings_get_json(general_json, general_size);
 
 		if (ret != ESP_OK) {
 			ESP_LOGE(TAG, "%s: Failed to get general settings JSON: %s",
 					 __func__, esp_err_to_name(ret));
+			free(general_json);
 			httpd_resp_set_status(req, "500 Internal Server Error");
 			httpd_resp_sendstr(
 				req, "{\"error\": \"Failed to retrieve general settings\"}");
@@ -607,6 +708,7 @@ static esp_err_t get_capabilities_handler(httpd_req_t *req) {
 		httpd_resp_set_status(req, "200 OK");
 		httpd_resp_set_type(req, "application/json");
 		httpd_resp_sendstr(req, general_json);
+		free(general_json);
 
 	} else if (strcmp(tab, "dsp") == 0) {
 #if CONFIG_USE_DSP_PROCESSOR
@@ -720,16 +822,7 @@ esp_err_t ui_http_add_action(const char *name, ui_action_fn fn) {
 
 static esp_err_t action_post_handler(httpd_req_t *req) {
 	ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
-	// the board's IP address or a LAN name only: a page on another site that
-	// points its own name at this board (DNS rebinding) is refused
-	if (!web_rescue_host_allowed(req)) return ESP_OK;
-	char hdr[4];
-	if (httpd_req_get_hdr_value_str(req, "X-Status-Action", hdr, sizeof(hdr)) !=
-			ESP_OK ||
-		strcmp(hdr, "1") != 0) {
-		httpd_resp_set_status(req, "403 Forbidden");
-		return httpd_resp_sendstr(req, "missing X-Status-Action header");
-	}
+	if (!action_allowed(req)) return ESP_OK;
 	const char *name = req->uri + strlen("/api/action/");
 	size_t len = strcspn(name, "?");
 	ui_action_fn fn = NULL;

@@ -11,6 +11,15 @@
 
 // External variable that need to be accessible
 extern struct netconn* lwipNetconn;
+extern volatile bool snapcast_stopping;  // main.c: a restart is under way
+
+// During a restart stay off the network, so no new connection outlives the
+// RST the restart sends. Called where this task holds no lock.
+void park_if_stopping(void) {
+  while (snapcast_stopping) {
+    vTaskDelay(portMAX_DELAY);
+  }
+}
 
 static const char* TAG = "CONNECTION_HANDLER";
 
@@ -19,9 +28,17 @@ void setup_network(esp_netif_t** netif) {
   uint16_t remotePort = 0;
 
   while (1) {
+    park_if_stopping();
+
     if (lwipNetconn != NULL) {
-      netconn_delete(lwipNetconn);
+      // clear the global first: the restart handler (main.c) reads it on
+      // lwIP's task. The close goes through that task, so a callback that
+      // already read the old pointer finishes before the free (a delete of
+      // a closed netconn frees it right here, without that round trip).
+      struct netconn* old = lwipNetconn;
       lwipNetconn = NULL;
+      netconn_close(old);  // already closed: just returns an error
+      netconn_delete(old);
     }
 
     ESP_LOGI(TAG, "Wait for network connection");
@@ -252,11 +269,21 @@ void setup_network(esp_netif_t** netif) {
     }
 
     if (rc1 != ERR_OK || rc2 != ERR_OK) {
-      netconn_close(lwipNetconn);
-      netconn_delete(lwipNetconn);
-      lwipNetconn = NULL;
+      struct netconn* old = lwipNetconn;
+      lwipNetconn = NULL;  // before the delete, as above
+      netconn_close(old);
+      netconn_delete(old);
 
       continue;
+    }
+
+    if (snapcast_stopping) {
+      // a restart began while connecting: end this connection too
+      struct netconn* old = lwipNetconn;
+      lwipNetconn = NULL;
+      netconn_close(old);
+      netconn_delete(old);
+      park_if_stopping();
     }
 
     ESP_LOGI(TAG, "netconn connected using %s", network_get_ifkey(*netif));

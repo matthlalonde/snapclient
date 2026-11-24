@@ -1,15 +1,26 @@
 #pragma once
 
+#include <stdbool.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+// What this boot runs as: read once at start-up, so a change from General
+// Settings shows after a restart
+typedef struct {
+  const char *hostname;        // mDNS host name
+  bool snapcast_enabled;
+  const char *snapcast_name;   // name in use (never empty)
+  bool sendspin_enabled;
+  const char *sendspin_name;
+} status_identity_t;
+
 /**
  * Register the settings page's live sections (GET /api/status):
- * output, snapcast, sendspin and device. `name` is the name this boot runs
- * under; it is copied.
+ * output, snapcast, sendspin and device. The strings in `id` are copied.
  */
-void status_sections_init(const char *name);
+void status_sections_init(const status_identity_t *id);
 
 /**
  * Event log hooks: status_events_boot() records the start-up (call right

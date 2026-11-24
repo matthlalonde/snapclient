@@ -21,6 +21,11 @@ static const char *NVS_KEY_HOSTNAME = "hostname";
 static const char *NVS_KEY_MDNS = "mdns";        // int32 0/1
 static const char *NVS_KEY_SERVER_HOST = "server_host"; // string
 static const char *NVS_KEY_SERVER_PORT = "server_port"; // int32
+static const char *NVS_KEY_SNAP_ON = "snap_on";         // int32 0/1, missing = on
+static const char *NVS_KEY_SS_ON = "ss_on";             // int32 0/1, missing = on
+static const char *NVS_KEY_SNAP_NAME = "snap_name";     // string, missing = hostname
+static const char *NVS_KEY_SS_NAME = "ss_name";         // string, missing = hostname
+static const char *NVS_KEY_SNAP_RENAME = "snap_rename"; // int32, 1 = still to send to the snapserver
 
 // Mutex for thread-safe NVS access
 static SemaphoreHandle_t hostname_mutex = NULL;
@@ -56,6 +61,20 @@ static bool validate_hostname(const char *hostname) {
     }
     ESP_LOGD(TAG, "%s: hostname '%s' valid", __func__, hostname);
     return true;
+}
+
+/* The hostname used when none is saved */
+static void default_hostname(char *hostname, size_t max_len) {
+#ifdef CONFIG_SNAPCLIENT_NAME
+    strncpy(hostname, CONFIG_SNAPCLIENT_NAME, max_len - 1);
+    hostname[max_len - 1] = '\0';
+    ESP_LOGD(TAG, "%s: Hostname from CONFIG: %s", __func__, hostname);
+#else
+    // Ultimate fallback
+    strncpy(hostname, "esp32-snapclient", max_len - 1);
+    hostname[max_len - 1] = '\0';
+    ESP_LOGW(TAG, "%s: Using default hostname: %s", __func__, hostname);
+#endif
 }
 
 esp_err_t settings_manager_init(void) {
@@ -108,19 +127,9 @@ esp_err_t settings_get_hostname(char *hostname, size_t max_len) {
     }
     
     // Fall back to CONFIG default
-#ifdef CONFIG_SNAPCLIENT_NAME
-    strncpy(hostname, CONFIG_SNAPCLIENT_NAME, max_len - 1);
-    hostname[max_len - 1] = '\0';
-    ESP_LOGD(TAG, "%s: Hostname from CONFIG: %s", __func__, hostname);
+    default_hostname(hostname, max_len);
     err = ESP_OK;
-#else
-    // Ultimate fallback
-    strncpy(hostname, "esp32-snapclient", max_len - 1);
-    hostname[max_len - 1] = '\0';
-    ESP_LOGW(TAG, "%s: Using default hostname: %s", __func__, hostname);
-    err = ESP_OK;
-#endif
-    
+
     xSemaphoreGive(hostname_mutex);
     return err;
 }
@@ -390,13 +399,13 @@ esp_err_t settings_get_server_port(int32_t *port) {
         int32_t v = 0;
         err = nvs_get_i32(h, NVS_KEY_SERVER_PORT, &v);
         nvs_close(h);
-        if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
-            ESP_LOGW(TAG, "%s: NVS read error: %s", __func__, esp_err_to_name(err));
-        }
-        xSemaphoreGive(hostname_mutex);
         if (err == ESP_OK) {
             *port = v;
+            xSemaphoreGive(hostname_mutex);
             return ESP_OK;
+        }
+        if (err != ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGW(TAG, "%s: NVS read error: %s", __func__, esp_err_to_name(err));
         }
     }
 
@@ -470,6 +479,242 @@ esp_err_t settings_clear_server_port(void) {
     return err;
 }
 
+/* An int32 0/1 flag; `def` when the key is missing or unreadable, and on an
+ * error return */
+static esp_err_t get_flag(const char *key, bool def, bool *value) {
+    if (!value) return ESP_ERR_INVALID_ARG;
+    *value = def;
+    if (!hostname_mutex) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(hostname_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
+    if (err == ESP_OK) {
+        int32_t v = 0;
+        err = nvs_get_i32(h, key, &v);
+        nvs_close(h);
+        if (err == ESP_OK) {
+            *value = (v != 0);
+        } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGW(TAG, "%s: %s: NVS read error: %s", __func__, key, esp_err_to_name(err));
+        }
+    }
+    ESP_LOGD(TAG, "%s: %s=%d", __func__, key, *value ? 1 : 0);
+    xSemaphoreGive(hostname_mutex);
+    return ESP_OK;
+}
+
+static esp_err_t set_flag(const char *key, bool value) {
+    if (!hostname_mutex) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(hostname_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_i32(h, key, value ? 1 : 0);
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+    }
+    xSemaphoreGive(hostname_mutex);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "%s: %s saved: %d", __func__, key, value ? 1 : 0);
+    } else {
+        ESP_LOGE(TAG, "%s: Failed to save %s: %s", __func__, key, esp_err_to_name(err));
+    }
+    return err;
+}
+
+/* A saved name, "" when none is saved (and on a read error) */
+static esp_err_t get_name(const char *key, char *name, size_t max_len) {
+    if (!name || max_len == 0) return ESP_ERR_INVALID_ARG;
+    name[0] = '\0';
+    if (!hostname_mutex) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(hostname_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
+    if (err == ESP_OK) {
+        size_t required = max_len;
+        err = nvs_get_str(h, key, name, &required);
+        nvs_close(h);
+    }
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        err = ESP_OK;  // no namespace or no key: nothing saved
+    } else if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s: %s: NVS read error: %s", __func__, key, esp_err_to_name(err));
+    }
+    if (err != ESP_OK) name[0] = '\0';
+    xSemaphoreGive(hostname_mutex);
+    return err;
+}
+
+/* "" or NULL erases the name */
+static esp_err_t set_name(const char *key, const char *name) {
+    bool erase = (name == NULL || name[0] == '\0');
+    if (!erase && !settings_name_valid(name)) {
+        ESP_LOGE(TAG, "%s: Invalid %s", __func__, key);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!hostname_mutex) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(hostname_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        if (erase) {
+            err = nvs_erase_key(h, key);
+            if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
+        } else {
+            err = nvs_set_str(h, key, name);
+        }
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+    }
+    xSemaphoreGive(hostname_mutex);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "%s: %s saved: %s", __func__, key, erase ? "(erased)" : name);
+    } else {
+        ESP_LOGE(TAG, "%s: Failed to save %s: %s", __func__, key, esp_err_to_name(err));
+    }
+    return err;
+}
+
+/* The saved name, else the hostname; always ESP_OK for valid arguments */
+static esp_err_t get_display_name(const char *key, char *name, size_t max_len) {
+    if (!name || max_len == 0) return ESP_ERR_INVALID_ARG;
+    // get_name gives the mutex back before settings_get_hostname takes it
+    if (get_name(key, name, max_len) == ESP_OK && name[0] != '\0') return ESP_OK;
+    if (settings_get_hostname(name, max_len) != ESP_OK) default_hostname(name, max_len);
+    return ESP_OK;
+}
+
+bool settings_name_valid(const char *name) {
+    if (!name) return false;
+    size_t len = strlen(name);
+    if (len == 0 || len > 63) return false;
+    if (name[0] == ' ' || name[len - 1] == ' ') return false;
+
+    const unsigned char *s = (const unsigned char *)name;
+    size_t i = 0;
+    while (i < len) {
+        unsigned char c = s[i];
+        if (c < 0x80) {
+            if (c < 0x20 || c == 0x7f) return false;  // control characters
+            i++;
+            continue;
+        }
+        // lead byte: how many continuation bytes follow, and the smallest
+        // code point that needs this many (anything less is overlong)
+        size_t n;
+        uint32_t cp, min;
+        if (c >= 0xc2 && c <= 0xdf) {
+            n = 1; cp = c & 0x1f; min = 0x80;
+        } else if (c >= 0xe0 && c <= 0xef) {
+            n = 2; cp = c & 0x0f; min = 0x800;
+        } else if (c >= 0xf0 && c <= 0xf4) {
+            n = 3; cp = c & 0x07; min = 0x10000;
+        } else {
+            return false;  // a stray continuation byte, 0xc0, 0xc1 or 0xf5-0xff
+        }
+        for (size_t k = 1; k <= n; k++) {
+            // the terminating NUL is not a continuation byte, so this also
+            // stops at the end of the string
+            if ((s[i + k] & 0xc0) != 0x80) return false;
+            cp = (cp << 6) | (s[i + k] & 0x3f);
+        }
+        if (cp < min || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return false;
+        if (cp >= 0x80 && cp <= 0x9f) return false;  // C1 control characters
+        i += n + 1;
+    }
+    return true;
+}
+
+/* Player on/off flags */
+esp_err_t settings_get_snapcast_enabled(bool *enabled) {
+    return get_flag(NVS_KEY_SNAP_ON, true, enabled);
+}
+
+esp_err_t settings_set_snapcast_enabled(bool enabled) {
+    return set_flag(NVS_KEY_SNAP_ON, enabled);
+}
+
+esp_err_t settings_get_sendspin_enabled(bool *enabled) {
+    return get_flag(NVS_KEY_SS_ON, true, enabled);
+}
+
+esp_err_t settings_set_sendspin_enabled(bool enabled) {
+    return set_flag(NVS_KEY_SS_ON, enabled);
+}
+
+/* Player names */
+esp_err_t settings_get_snapcast_name(char *name, size_t max_len) {
+    return get_name(NVS_KEY_SNAP_NAME, name, max_len);
+}
+
+esp_err_t settings_set_snapcast_name(const char *name) {
+    return set_name(NVS_KEY_SNAP_NAME, name);
+}
+
+esp_err_t settings_get_sendspin_name(char *name, size_t max_len) {
+    return get_name(NVS_KEY_SS_NAME, name, max_len);
+}
+
+esp_err_t settings_set_sendspin_name(const char *name) {
+    return set_name(NVS_KEY_SS_NAME, name);
+}
+
+esp_err_t settings_get_snapcast_display_name(char *name, size_t max_len) {
+    return get_display_name(NVS_KEY_SNAP_NAME, name, max_len);
+}
+
+esp_err_t settings_get_sendspin_display_name(char *name, size_t max_len) {
+    return get_display_name(NVS_KEY_SS_NAME, name, max_len);
+}
+
+/* Snapcast name still to be sent to the snapserver */
+esp_err_t settings_get_snapcast_rename_pending(bool *pending) {
+    return get_flag(NVS_KEY_SNAP_RENAME, false, pending);
+}
+
+esp_err_t settings_set_snapcast_rename_pending(bool pending) {
+    return set_flag(NVS_KEY_SNAP_RENAME, pending);
+}
+
+esp_err_t settings_clear_snapcast_rename_if(const char *sent_name, bool *cleared) {
+    if (cleared) *cleared = false;
+    if (!sent_name) return ESP_ERR_INVALID_ARG;
+    if (!hostname_mutex) return ESP_ERR_INVALID_STATE;
+    // one mutex hold for the compare and the clear, so a name saved in between
+    // keeps its pending rename
+    if (xSemaphoreTake(hostname_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        // the name in use, as settings_get_snapcast_display_name works it out
+        char name[64] = "";
+        size_t len = sizeof(name);
+        if (nvs_get_str(h, NVS_KEY_SNAP_NAME, name, &len) != ESP_OK || name[0] == '\0') {
+            len = sizeof(name);
+            if (nvs_get_str(h, NVS_KEY_HOSTNAME, name, &len) != ESP_OK || name[0] == '\0') {
+                default_hostname(name, sizeof(name));
+            }
+        }
+        if (strcmp(name, sent_name) == 0) {
+            err = nvs_erase_key(h, NVS_KEY_SNAP_RENAME);
+            if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
+            if (err == ESP_OK) err = nvs_commit(h);
+            if (err == ESP_OK && cleared) *cleared = true;
+        }
+        nvs_close(h);
+    }
+    xSemaphoreGive(hostname_mutex);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "%s: %s", __func__, esp_err_to_name(err));
+    }
+    return err;
+}
+
 esp_err_t settings_get_json(char *json_out, size_t max_len) {
     ESP_LOGD(TAG, "%s: entered", __func__);
     
@@ -504,6 +749,28 @@ esp_err_t settings_get_json(char *json_out, size_t max_len) {
     if (settings_get_server_port(&port) == ESP_OK && port != 0) {
         cJSON_AddNumberToObject(root, "server_port", port);
     }
+
+    // Player on/off flags (both on unless saved off)
+    bool on = true;
+    settings_get_snapcast_enabled(&on);
+    cJSON_AddBoolToObject(root, "snapcast_enabled", on);
+    on = true;
+    settings_get_sendspin_enabled(&on);
+    cJSON_AddBoolToObject(root, "sendspin_enabled", on);
+
+    // Saved player names, "" when none is saved (the hostname is used then)
+    char name[64];
+    settings_get_snapcast_name(name, sizeof(name));
+    cJSON_AddStringToObject(root, "snapcast_name", name);
+    settings_get_sendspin_name(name, sizeof(name));
+    cJSON_AddStringToObject(root, "sendspin_name", name);
+
+    // Add Sendspin availability flag
+#if CONFIG_SENDSPIN_PLAYER_ENABLE
+    cJSON_AddBoolToObject(root, "sendspin_available", true);
+#else
+    cJSON_AddBoolToObject(root, "sendspin_available", false);
+#endif
 
     // Add DSP availability flag
 #if CONFIG_USE_DSP_PROCESSOR
@@ -561,6 +828,8 @@ esp_err_t settings_set_from_json(const char *json_in) {
     }
 
     esp_err_t err = ESP_OK;
+    bool hostname_saved = false;
+    bool snap_name_saved = false;
 
     // Update hostname if present
     cJSON *hostname = cJSON_GetObjectItem(root, "hostname");
@@ -569,6 +838,8 @@ esp_err_t settings_set_from_json(const char *json_in) {
         if (save_err != ESP_OK) {
             ESP_LOGW(TAG, "%s: Failed to save hostname", __func__);
             err = save_err;
+        } else {
+            hostname_saved = true;
         }
     }
 
@@ -600,6 +871,59 @@ esp_err_t settings_set_from_json(const char *json_in) {
             ESP_LOGW(TAG, "%s: Failed to save server_port", __func__);
             err = save_err;
         }
+    }
+
+    // Update the player on/off flags if present
+    cJSON *snap_on = cJSON_GetObjectItem(root, "snapcast_enabled");
+    if (cJSON_IsBool(snap_on)) {
+        esp_err_t save_err = settings_set_snapcast_enabled(cJSON_IsTrue(snap_on));
+        if (save_err != ESP_OK) {
+            ESP_LOGW(TAG, "%s: Failed to save snapcast_enabled", __func__);
+            err = save_err;
+        }
+    }
+
+    cJSON *ss_on = cJSON_GetObjectItem(root, "sendspin_enabled");
+    if (cJSON_IsBool(ss_on)) {
+        esp_err_t save_err = settings_set_sendspin_enabled(cJSON_IsTrue(ss_on));
+        if (save_err != ESP_OK) {
+            ESP_LOGW(TAG, "%s: Failed to save sendspin_enabled", __func__);
+            err = save_err;
+        }
+    }
+
+    // Update the player names if present ("" clears)
+    cJSON *snap_name = cJSON_GetObjectItem(root, "snapcast_name");
+    if (cJSON_IsString(snap_name) && snap_name->valuestring) {
+        esp_err_t save_err = settings_set_snapcast_name(snap_name->valuestring);
+        if (save_err != ESP_OK) {
+            ESP_LOGW(TAG, "%s: Failed to save snapcast_name", __func__);
+            err = save_err;
+        } else {
+            snap_name_saved = true;
+        }
+    }
+
+    cJSON *ss_name = cJSON_GetObjectItem(root, "sendspin_name");
+    if (cJSON_IsString(ss_name) && ss_name->valuestring) {
+        esp_err_t save_err = settings_set_sendspin_name(ss_name->valuestring);
+        if (save_err != ESP_OK) {
+            ESP_LOGW(TAG, "%s: Failed to save sendspin_name", __func__);
+            err = save_err;
+        }
+    }
+
+    // A new snapcast name, or a new hostname while no snapcast name is
+    // saved, is sent to the snapserver at the next boot
+    bool rename = snap_name_saved;
+    if (hostname_saved && !rename) {
+        char name[64] = "";
+        settings_get_snapcast_name(name, sizeof(name));
+        rename = (name[0] == '\0');
+    }
+    if (rename) {
+        esp_err_t save_err = settings_set_snapcast_rename_pending(true);
+        if (save_err != ESP_OK) err = save_err;
     }
 
     cJSON_Delete(root);

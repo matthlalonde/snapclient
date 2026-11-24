@@ -172,6 +172,38 @@
       background: transparent;
     }
 
+    .hint {
+      color: #888;
+      font-size: 12px;
+      margin-top: 12px;
+    }
+
+    /* a label, but not a setting title (.setting-control label) */
+    .setting-control .switch-row {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 14px 0 0 0;
+      font-size: 14px;
+      font-weight: normal;
+    }
+
+    .switch-row .hint {
+      margin-top: 0;
+    }
+
+    /* Players card: one block per player, a line between them */
+    .player .switch-row {
+      margin: 0 0 12px 0;
+    }
+
+    .player + .player {
+      margin-top: 16px;
+      padding-top: 14px;
+      border-top: 1px solid #e9ecef;
+    }
+
     /* Sendspin pairing: live state from /api/status */
     #sendspin-pairing {
       margin-top: 20px;
@@ -224,27 +256,6 @@
       flex-wrap: wrap;
       gap: 10px;
       margin-top: 14px;
-    }
-
-    #sendspin-pairing .hint {
-      color: #888;
-      font-size: 12px;
-      margin-top: 12px;
-    }
-
-    /* a label, but not a setting title (.setting-control label) */
-    #sendspin-pairing .switch-row {
-      display: flex;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin: 14px 0 0 0;
-      font-size: 14px;
-      font-weight: normal;
-    }
-
-    #sendspin-pairing .switch-row .hint {
-      margin-top: 0;
     }
 
     #sendspin-pairing.highlight {
@@ -308,6 +319,12 @@
     let currentSnapPort = '';
     let needsRestart = false; // Track if device needs restart
     let isDirty = false;
+    // Players card: as saved on the board ('' name: uses the hostname)
+    let currentSnapOn = true;
+    let currentSnapName = '';
+    let currentSendspinOn = true;
+    let currentSendspinName = '';
+    let sendspinAvailable = false;  // built in (not in the no-PSRAM build)
 
     // Load current settings
     async function loadSettings() {
@@ -326,7 +343,13 @@
         currentSnapUseMDNS = capabilities.mdns_enabled !== undefined ? capabilities.mdns_enabled : true;
         currentSnapHost = capabilities.server_host || '';
         currentSnapPort = capabilities.server_port || '';
-        
+        // older firmware sends none of these: both on, no names, no Sendspin row
+        currentSnapOn = capabilities.snapcast_enabled !== false;
+        currentSendspinOn = capabilities.sendspin_enabled !== false;
+        currentSnapName = typeof capabilities.snapcast_name === 'string' ? capabilities.snapcast_name : '';
+        currentSendspinName = typeof capabilities.sendspin_name === 'string' ? capabilities.sendspin_name : '';
+        sendspinAvailable = capabilities.sendspin_available === true;
+
         renderUI();
       } catch (error) {
         console.error('Error loading settings:', error);
@@ -378,11 +401,12 @@
       html += '<button class="btn btn-danger" id="restart-btn-snap" onclick="requestRestart()" style="background-color:#e74c3c;" disabled>Restart</button>';
       html += '</div>';
       html += '</div>'; // .setting-control.setting-section
+      html += playersHtml();
       html += '</div>';
-      
+
       // Info message
       html += '<div class="info">';
-      html += '<strong>Note:</strong> After changing the hostname or the Snapserver settings, you will need to restart the device for the changes to take effect.';
+      html += '<strong>Note:</strong> After changing the hostname, the Snapserver settings or the players, you will need to restart the device for the changes to take effect.';
       html += '</div>';
       
       app.innerHTML = html;
@@ -489,6 +513,10 @@
       const restartBtnSnap = document.getElementById('restart-btn-snap');
       if (restartBtnSnap) {
         restartBtnSnap.disabled = !needsRestart;
+      }
+      const restartBtnPlayers = document.getElementById('restart-btn-players');
+      if (restartBtnPlayers) {
+        restartBtnPlayers.disabled = !needsRestart;
       }
     }
 
@@ -643,6 +671,212 @@
         console.error('Error clearing hostname:', error);
         alert('Failed to clear hostname. Please try again.');
       });
+    }
+
+    // ---- Players: snapcast and Sendspin on or off, and the name each one
+    // shows. Saved on the board, applied at the next start ----
+
+    let playersSaving = false;
+
+    function playerHtml(id, title, from, on, name) {
+      const host = escapeHtml(currentHostname);
+      let html = '<div class="player">';
+      html += `<label class="switch-row"><input type="checkbox" id="${id}-on" onchange="handlePlayersChange()"${on ? ' checked' : ''}> ${escapeHtml(title)} <span class="hint">${escapeHtml(from)}</span></label>`;
+      html += `<label for="${id}-name">${escapeHtml(title)} name</label>`;
+      html += `<div class="description">Empty uses the hostname, ${host}.</div>`;
+      html += `<input type="text" id="${id}-name" value="${escapeHtml(name)}" placeholder="${host}" maxlength="63" oninput="handlePlayersChange()">`;
+      html += `<div id="${id}-name-validation" class="validation-error"></div>`;
+      html += '</div>';
+      return html;
+    }
+
+    function playersHtml() {
+      let html = '<div class="setting-control" id="players">';
+      html += '<label>Players</label>';
+      html += '<div class="description">Untick a player to turn it off. The name is what its server shows for this device.</div>';
+      html += playerHtml('snapcast', 'Snapcast', '(from a snapserver)', currentSnapOn, currentSnapName);
+      if (sendspinAvailable) {
+        html += playerHtml('sendspin', 'Sendspin', '(from Music Assistant)', currentSendspinOn, currentSendspinName);
+      }
+      html += '<div class="button-group">';
+      html += '<button class="btn btn-primary" id="save-players-btn" onclick="savePlayers()" disabled>Save Changes</button>';
+      html += '<button class="btn btn-danger" id="restart-btn-players" onclick="requestRestart()" style="background-color:#e74c3c;" disabled>Restart</button>';
+      html += '</div>';
+      html += '<div id="players-msg" role="status" hidden></div>';
+      html += '<div class="hint">Changes apply after a restart. A new Snapcast name is also set on the snapserver after the restart. Music Assistant may keep its own name for the player: rename it there if needed.';
+      if (sendspinAvailable) html += ' Turning Sendspin off keeps its paired servers.';
+      html += '</div>';
+      html += '</div>';
+      return html;
+    }
+
+    // what the card asks for now, names trimmed
+    function readPlayers() {
+      const want = {
+        snapOn: document.getElementById('snapcast-on').checked,
+        snapName: document.getElementById('snapcast-name').value.trim(),
+        ssOn: currentSendspinOn,
+        ssName: currentSendspinName,
+      };
+      if (sendspinAvailable) {
+        want.ssOn = document.getElementById('sendspin-on').checked;
+        want.ssName = document.getElementById('sendspin-name').value.trim();
+      }
+      return want;
+    }
+
+    // [param, value, label, apply] for each field that differs from the board
+    function playerChanges(want) {
+      const changes = [];
+      if (want.snapOn !== currentSnapOn) {
+        changes.push(['snapcast_enabled', want.snapOn ? '1' : '0', 'Snapcast on/off', () => { currentSnapOn = want.snapOn; }]);
+      }
+      if (want.snapName !== currentSnapName) {
+        changes.push(['snapcast_name', want.snapName, 'Snapcast name', () => {
+          currentSnapName = want.snapName;
+          document.getElementById('snapcast-name').value = want.snapName;
+        }]);
+      }
+      if (sendspinAvailable) {
+        if (want.ssOn !== currentSendspinOn) {
+          changes.push(['sendspin_enabled', want.ssOn ? '1' : '0', 'Sendspin on/off', () => { currentSendspinOn = want.ssOn; }]);
+        }
+        if (want.ssName !== currentSendspinName) {
+          changes.push(['sendspin_name', want.ssName, 'Sendspin name', () => {
+            currentSendspinName = want.ssName;
+            document.getElementById('sendspin-name').value = want.ssName;
+          }]);
+        }
+      }
+      // turning a player off goes last: if a save fails partway, no more
+      // players are off than asked for
+      const turnsOff = (c) => c[0].endsWith('_enabled') && c[1] === '0';
+      return changes.sort((a, b) => turnsOff(a) - turnsOff(b));
+    }
+
+    // Empty (uses the hostname), or 1-63 bytes of UTF-8 with no control
+    // characters, as the board checks it
+    function validatePlayerName(name) {
+      if (name === '') return null;
+      try {
+        encodeURIComponent(name);  // throws on a broken character (lone surrogate)
+      } catch (e) {
+        return 'Name contains a character that cannot be sent';
+      }
+      if (/[\u0000-\u001f\u007f-\u009f]/.test(name)) {
+        return 'Name cannot contain control characters';
+      }
+      if (new TextEncoder().encode(name).length > 63) {
+        return 'Name must be 63 bytes or less (accented letters and symbols take 2 to 4 bytes)';
+      }
+      return null;
+    }
+
+    // show each name's problem under it; true when all are fine
+    function validatePlayers(want) {
+      let ok = true;
+      const check = (id, name) => {
+        const error = validatePlayerName(name);
+        document.getElementById(`${id}-name-validation`).textContent = error || '';
+        if (error) ok = false;
+      };
+      check('snapcast', want.snapName);
+      if (sendspinAvailable) check('sendspin', want.ssName);
+      return ok;
+    }
+
+    function updatePlayersSave() {
+      const want = readPlayers();
+      const ok = validatePlayers(want);
+      document.getElementById('save-players-btn').disabled =
+        playersSaving || !ok || playerChanges(want).length === 0;
+    }
+
+    function setPlayersMsg(text, kind) {
+      const msg = document.getElementById('players-msg');
+      msg.textContent = text;
+      msg.className = kind;
+      msg.hidden = !text;
+    }
+
+    function handlePlayersChange() {
+      setPlayersMsg('', '');
+      updatePlayersSave();
+    }
+
+    // These settings are guarded on the board: same origin (not BACKEND_URL)
+    // and the X-Status-Action header, which another site's page can't send.
+    // Returns null when saved, else the board's reason.
+    async function postPlayerSetting(param, value) {
+      const controller = new AbortController();
+      const abort = setTimeout(() => controller.abort(), 5000);
+      try {
+        const response = await fetch(`/post?param=${param}&value=${encodeURIComponent(value)}`, {
+          method: 'POST',
+          headers: { 'X-Status-Action': '1' },
+          cache: 'no-store',
+          signal: controller.signal,
+        });
+        if (response.ok) return null;
+        let text = '';
+        try {
+          text = (await response.text()).trim();
+        } catch (e) {
+          text = '';
+        }
+        return text ? text.slice(0, 200) : `HTTP ${response.status}`;
+      } catch (error) {
+        return "couldn't reach the device";
+      } finally {
+        clearTimeout(abort);
+      }
+    }
+
+    async function savePlayers() {
+      const want = readPlayers();
+      if (playersSaving || !validatePlayers(want)) return;
+      const changes = playerChanges(want);
+      if (changes.length === 0) return;
+      const turnsOneOff = (currentSnapOn && !want.snapOn)
+        || (sendspinAvailable && currentSendspinOn && !want.ssOn);
+      if (turnsOneOff && !want.snapOn && !(sendspinAvailable && want.ssOn)) {
+        const ask = sendspinAvailable
+          ? 'Turn off both players? The board will play nothing until one is turned back on.'
+          : 'Turn off Snapcast, the only player in this build? The board will play nothing until it is turned back on.';
+        if (!confirm(ask)) return;
+      }
+
+      const saveBtn = document.getElementById('save-players-btn');
+      playersSaving = true;
+      saveBtn.disabled = true;
+      saveBtn.textContent = 'Saving...';
+      setPlayersMsg('', '');
+      const saved = [];
+      let failed = null;
+      for (const [param, value, label, apply] of changes) {
+        const error = await postPlayerSetting(param, value);
+        if (error) {
+          failed = `${label} not saved: ${error}`;
+          break;
+        }
+        apply();
+        saved.push(label);
+      }
+      playersSaving = false;
+      saveBtn.textContent = 'Save Changes';
+
+      if (saved.length > 0) {
+        needsRestart = true;
+        updateRestartButton();
+      }
+      if (!failed) {
+        setPlayersMsg('Saved. Restart the device to apply the changes.', 'success');
+      } else if (saved.length > 0) {
+        setPlayersMsg(`${saved.join(', ')} saved (restart to apply). ${failed}`, 'error');
+      } else {
+        setPlayersMsg(failed, 'error');
+      }
+      updatePlayersSave();
     }
 
     // Initialize on page load

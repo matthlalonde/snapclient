@@ -39,6 +39,7 @@
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_pm.h"
 #include "esp_random.h"
 #include "esp_system.h"
@@ -1285,6 +1286,9 @@ class Player : public sendspin::PlayerRoleListener,
       group_playing_ = false;
       have_sync_error_ = false;
     }
+    if (connected != was_connected_) {
+      status_led_set_sendspin_connected(connected);
+    }
     was_connected_ = connected;
     if (now < next_status_us_) {
       return;
@@ -1521,6 +1525,18 @@ void loop_task(void *) {
   cfg.name = g_name;
   cfg.product_name = "ESP32-S3 snapclient";
   cfg.software_version = esp_app_get_description()->version;
+  if (CONFIG_SENDSPIN_MANUFACTURER[0] != '\0') {
+    cfg.manufacturer = CONFIG_SENDSPIN_MANUFACTURER;
+  }
+  // always the WiFi STA MAC, like snapcast's hello, whatever netif is the
+  // default; if the read fails the library finds one itself
+  uint8_t mac[6];
+  if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
+    char mac_str[18];
+    std::snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    cfg.mac_address = std::string(mac_str);
+  }
   cfg.server_port = CONFIG_SENDSPIN_PLAYER_PORT;
   // task stacks that never touch flash go to PSRAM to spare internal RAM.
   // Larger than the library defaults: those leave ~200 B of slack, measured

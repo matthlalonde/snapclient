@@ -4,8 +4,8 @@
  *   white            booting
  *   amber, blinking  connecting to the network
  *   magenta, blink   no WiFi credentials yet (provision with Improv)
- *   blue             network up, connecting to the snapserver
- *   green, dim       connected to the snapserver, idle / muted
+ *   blue             network up, no snapserver or Sendspin server yet
+ *   green, dim       connected to a snapserver or Sendspin server, idle / muted
  *   green, bright    playing
  *   red, blinking    error
  *   cyan, blinking   rescue / setup access point
@@ -23,6 +23,7 @@
 
 void status_led_init(void) {}
 void status_led_set_server_connected(bool connected) {}
+void status_led_set_sendspin_connected(bool connected) {}
 void status_led_set_playing(bool playing) {}
 void status_led_set_error(bool error) {}
 void status_led_set_rescue(bool rescue) {}
@@ -52,6 +53,7 @@ static volatile bool s_wifi_up = false;
 static volatile bool s_eth_up = false;
 static volatile bool s_need_provisioning = false;
 static volatile bool s_server = false;
+static volatile bool s_sendspin = false;
 static volatile bool s_playing = false;
 static volatile bool s_error = false;
 static volatile bool s_rescue = false;
@@ -185,12 +187,12 @@ static pattern_t current_pattern(void) {
     if (s_need_provisioning) return (pattern_t){255, 0, 255, true};
     return (pattern_t){255, 128, 0, true};
   }
-  if (!s_server) return (pattern_t){0, 0, 255, false};
+  if (!s_server && !s_sendspin) return (pattern_t){0, 0, 255, false};
 #if CONFIG_STATUS_LED_RGB_GPIO
   // no dimming on plain GPIOs: idle and playing both show green
   return (pattern_t){0, 255, 0, false};
 #else
-  if (s_server && s_playing) return (pattern_t){0, 255, 0, false};
+  if (s_playing) return (pattern_t){0, 255, 0, false};
   return (pattern_t){0, 60, 0, false};
 #endif
 }
@@ -240,7 +242,8 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id,
       if (id == WIFI_EVENT_STA_DISCONNECTED) s_wifi_up = false;
     }
   } else if (base == IP_EVENT) {
-    // the http task owns s_server; net-down already wins in the pattern
+    // the players own s_server and s_sendspin; net-down already wins in the
+    // pattern
     if (id == IP_EVENT_STA_GOT_IP) {
       s_wifi_up = true;
       s_need_provisioning = false;
@@ -281,6 +284,12 @@ void status_led_init(void) {
 
 void status_led_set_server_connected(bool connected) {
   s_server = connected;
+  if (connected) s_booting = false;
+  kick();
+}
+
+void status_led_set_sendspin_connected(bool connected) {
+  s_sendspin = connected;
   if (connected) s_booting = false;
   kick();
 }

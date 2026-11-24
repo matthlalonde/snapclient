@@ -1,9 +1,9 @@
 // The settings page's live tabs (GET /api/status, see ui_http_server.h):
 //   output    which source owns the I2S output (AUX and optical) and its format
-//   snapcast  server connection, stream, sync health
-//   sendspin  server, group, stream, volume, pairing
-//   device    firmware, OTA state and update slot, uptime, last reset, WiFi,
-//             memory, stack headroom
+//   snapcast  on or off, its name, server connection, stream, sync health
+//   sendspin  on or off, its name, server, group, stream, volume, pairing
+//   device    host name, firmware, OTA state and update slot, uptime, last
+//             reset, WiFi, memory, stack headroom
 //   events    a change counter for the event log (GET /api/events)
 // It also records the start-up and WiFi events in the event log.
 // Each section runs on the web server's task and only copies snapshots that
@@ -35,6 +35,7 @@
 #include "sdkconfig.h"
 #include "sendspin_player.h"
 #include "snapcast_status.h"
+#include "snapserver_rename.h"
 #include "ui_http_server.h"
 
 static const char *TAG = "STATUS";
@@ -42,9 +43,15 @@ static const char *TAG = "STATUS";
 #define MACFMT "%02X:%02X:%02X:%02X:%02X:%02X"
 #define MAC(b) (b)[0], (b)[1], (b)[2], (b)[3], (b)[4], (b)[5]
 
-// the name this boot runs under (mDNS, snapserver, Sendspin); a new name
-// from General Settings applies after a restart
+// what this boot runs as: the host name (mDNS), whether each player is on
+// and the name it uses. Changes from General Settings apply after a restart.
 static char device_name[64];
+static bool snapcast_enabled = true;
+static char snapcast_name[64];
+#if CONFIG_SENDSPIN_PLAYER_ENABLE
+static bool sendspin_enabled = true;
+static char sendspin_name[64];
+#endif
 
 static double seconds_since(int64_t then_us, int64_t now_us) {
   return (double)((now_us - then_us) / 1000000);
@@ -191,10 +198,26 @@ static const char *player_state_text(snapcast_player_state_t s) {
 }
 
 static void snapcast_section(cJSON *o) {
+  cJSON_AddBoolToObject(o, "enabled", snapcast_enabled);
+  cJSON_AddStringToObject(o, "name", snapcast_name);
+  if (!snapcast_enabled) {
+    // the keys the page and Home Assistant read, with off values
+    cJSON_AddBoolToObject(o, "connected", false);
+    cJSON_AddNumberToObject(o, "connections", 0);
+    cJSON_AddStringToObject(o, "player", "off");
+    cJSON_AddNumberToObject(o, "hard_resyncs", 0);
+    return;
+  }
+
   snapcast_status_t s;
   snapcast_status_get(&s);
   int64_t now = esp_timer_get_time();
 
+  // only when a rename on the snapserver was due this boot
+  const char *rename_state = snapserver_rename_state();
+  if (rename_state[0] != '\0') {
+    cJSON_AddStringToObject(o, "server_rename", rename_state);
+  }
   if (s.server_host[0] != '\0' || s.server_ip[0] != '\0') {
     cJSON_AddStringToObject(o, "server_host",
                             s.server_host[0] ? s.server_host : s.server_ip);
@@ -258,8 +281,11 @@ static void snapcast_section(cJSON *o) {
 
 #if CONFIG_SENDSPIN_PLAYER_ENABLE
 static void sendspin_section(cJSON *o) {
+  cJSON_AddBoolToObject(o, "enabled", sendspin_enabled);
+  cJSON_AddStringToObject(o, "name", sendspin_name);
   sendspin_status_t s;
-  if (!sendspin_player_get_status(&s)) {
+  if (!sendspin_enabled || !sendspin_player_get_status(&s)) {
+    // off, or on but failed or still starting
     cJSON_AddBoolToObject(o, "running", false);
     return;
   }
@@ -612,8 +638,17 @@ void status_events_start(void) {
   esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_events, NULL);
 }
 
-void status_sections_init(const char *name) {
-  snprintf(device_name, sizeof(device_name), "%s", name ? name : "");
+void status_sections_init(const status_identity_t *id) {
+  snprintf(device_name, sizeof(device_name), "%s",
+           id && id->hostname ? id->hostname : "");
+  snapcast_enabled = id ? id->snapcast_enabled : true;
+  snprintf(snapcast_name, sizeof(snapcast_name), "%s",
+           id && id->snapcast_name ? id->snapcast_name : "");
+#if CONFIG_SENDSPIN_PLAYER_ENABLE
+  sendspin_enabled = id ? id->sendspin_enabled : true;
+  snprintf(sendspin_name, sizeof(sendspin_name), "%s",
+           id && id->sendspin_name ? id->sendspin_name : "");
+#endif
   ui_http_add_status_section("output", output_section);
   ui_http_add_status_section("snapcast", snapcast_section);
 #if CONFIG_SENDSPIN_PLAYER_ENABLE

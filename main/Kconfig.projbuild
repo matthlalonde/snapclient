@@ -31,6 +31,13 @@ menu "Snapclient Configuration"
         help
             Port of the snapserver to connect to.
 
+    config SNAPSERVER_CONTROL_PORT
+        int "Snapserver control port"
+        default 1705
+        range 1 65535
+        help
+            The snapserver's JSON-RPC port (TCP). After a new snapcast name is saved, the board sets it there once.
+
     config SNAPCLIENT_NAME
         string "snapclient name"
         default "ESP32-Caster"

@@ -42,6 +42,14 @@ menu "Sendspin player"
             Music Assistant does not reconnect by itself after an unpaired
             connection is refused.
 
+    config SENDSPIN_MANUFACTURER
+        string "Manufacturer"
+        depends on SENDSPIN_PLAYER_ENABLE
+        default "Espressif"
+        help
+            The manufacturer Music Assistant shows for this player. Leave it
+            empty to send none.
+
     # For the component manager only (idf_component.yml): 1 when the player
     # is on, so sendspin-cpp is fetched. The rule can't test
     # SENDSPIN_PLAYER_ENABLE: off and hidden (no PSRAM, or the WM8804

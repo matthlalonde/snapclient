@@ -137,6 +137,20 @@
       queue_empty: 'audio ran out (network gap)',
     };
 
+    // a new snapcast name, set on the snapserver once after a restart
+    const SERVER_RENAME = {
+      pending: 'renaming on the snapserver',
+      renaming: 'renaming on the snapserver',
+      done: 'renamed on the snapserver',
+      failed: 'could not rename on the snapserver (see the event log)',
+    };
+
+    // a player turned off: its card shows only this
+    const OFF_ROWS = [['State', 'turned off in General Settings']];
+
+    // set by render(): the Sendspin rows don't mention snapcast when it's off
+    let snapcastOff = false;
+
     // Clock correction rate from the snapcast frame counters: frames skipped
     // (catch up) minus frames repeated (hold back) over the last minute.
     const CORRECTION_WINDOW_MS = 60000;
@@ -186,6 +200,11 @@
 
     const ROWS = {
       snapcast: [
+        ['Name', s => {
+          const rename = SERVER_RENAME[s.server_rename] || null;
+          if (!has(s.name)) return rename;
+          return rename ? `${s.name}; ${rename}` : s.name;
+        }],
         ['Server', s => {
           if (!has(s.server_host)) return null;
           const ip = has(s.server_ip) && s.server_ip !== s.server_host ? ` (${s.server_ip})` : '';
@@ -218,6 +237,7 @@
         }],
       ],
       sendspin: [
+        ['Name', s => s.name || null],
         ['State', s => s.running === false ? 'not running (see the device log)' : null],
         ['Server', s => s.running === false ? null
           : s.connected ? (s.server_name || 'connected') : 'none connected'],
@@ -253,10 +273,16 @@
             : mmss(np.progress_ms);
         }],
         ['Stream', s => s.stream ? (codecFormat(s) || 'starting') : null],
-        ['Audio output', s => s.running === false ? null : s.output_open
-          ? `${format(s.output_rate ? { sample_rate: s.output_rate, bits: s.output_bits } : {}) || 'open'}, snapcast paused`
-          : s.output_failed ? 'could not open it (see the device log); retrying'
-          : s.waiting_for_output ? 'waiting for snapcast to let go' : 'not in use'],
+        ['Audio output', s => {
+          if (s.running === false) return null;
+          if (s.output_open) {
+            const fmt = format(s.output_rate ? { sample_rate: s.output_rate, bits: s.output_bits } : {}) || 'open';
+            return snapcastOff ? fmt : `${fmt}, snapcast paused`;
+          }
+          if (s.output_failed) return 'could not open it (see the device log); retrying';
+          if (s.waiting_for_output) return snapcastOff ? 'waiting to open it' : 'waiting for snapcast to let go';
+          return 'not in use';
+        }],
         ['Volume', s => volume(s)],
         ['Listening on', s => has(s.port) ? `port ${s.port}` : null],
         ['Client ID', s => s.client_id || null],
@@ -355,16 +381,21 @@
       document.getElementById('art-actions').hidden = !anyArt;
 
       const sc = st.snapcast;
+      const scOff = !!sc && sc.enabled === false;
+      snapcastOff = scOff;
       if (sc) {
         trackCorrection(sc);
-        if (sc.player === 'handed_over') setBadge('badge-snapcast', 'paused for Sendspin', 'warn');
+        if (scOff) setBadge('badge-snapcast', 'off', 'off');
+        else if (sc.player === 'handed_over') setBadge('badge-snapcast', 'paused for Sendspin', 'warn');
         else if (!sc.connected) setBadge('badge-snapcast', 'not connected', 'off');
         else if (sc.player === 'playing') setBadge('badge-snapcast', 'playing', 'ok');
         else setBadge('badge-snapcast', 'connected', 'ok');
       }
       const ss = st.sendspin;
+      const ssOff = !!ss && ss.enabled === false;
       if (ss) {
-        if (ss.running === false) setBadge('badge-sendspin', 'not running', 'warn');
+        if (ssOff) setBadge('badge-sendspin', 'off', 'off');
+        else if (ss.running === false) setBadge('badge-sendspin', 'not running', 'warn');
         else if (ss.pairing && ss.pairing.waiting) setBadge('badge-sendspin', 'asks to pair', 'warn');
         else if (ss.output_open) setBadge('badge-sendspin', 'playing', 'ok');
         else if (ss.output_failed) setBadge('badge-sendspin', 'output error', 'warn');
@@ -372,8 +403,8 @@
         else setBadge('badge-sendspin', 'waiting for a server', 'off');
       }
 
-      renderCard('snapcast', ROWS.snapcast, sc);
-      renderCard('sendspin', ROWS.sendspin, ss);
+      renderCard('snapcast', scOff ? OFF_ROWS : ROWS.snapcast, sc);
+      renderCard('sendspin', ssOff ? OFF_ROWS : ROWS.sendspin, ss);
       renderPairPrompt(ss);
 
       document.getElementById('updated').textContent =

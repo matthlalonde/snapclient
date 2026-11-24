@@ -8,9 +8,12 @@ menu "Status LED"
               white   booting
               amber   (blinking) connecting to WiFi / Ethernet
               magenta (blinking) no WiFi credentials stored yet
-              blue    network up, looking for / connecting to the snapserver
-              green   connected to the snapserver, idle or muted (dim)
+              blue    network up, no snapserver or Sendspin server yet
+              green   connected to a snapserver or Sendspin server, idle
+                      or muted (dim)
               green   playing (bright)
+              violet  Sendspin pairing window open (blinking: a server
+                      waits for it)
               red     (blinking) fatal error (audio board init failed)
               cyan    (blinking) rescue / setup access point
 

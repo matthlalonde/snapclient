@@ -23,6 +23,8 @@
 #include "player.h"
 
 extern TaskHandle_t t_http_get_task;
+extern volatile bool snapcast_stopping;      // main.c, see its restart handler
+extern portMUX_TYPE snapcast_task_mux;
 
 const int OTA_CONNECTED_BIT = BIT0;
 static const char *TAG = "OTA";
@@ -168,7 +170,20 @@ void ota_server_start_my(void) {
   // SuspendAllThreads();
   // KillAllThreads();
   // dsp_i2s_task_deinit();
-  vTaskDelete(t_http_get_task);
+  // Take the snapcast task's handle away from the restart handler in main.c
+  // before deleting it; if a restart is already under way, let it finish.
+  // NULL when snapcast is off (vTaskDelete(NULL) would end this task).
+  portENTER_CRITICAL(&snapcast_task_mux);
+  bool restarting = snapcast_stopping;
+  TaskHandle_t http = restarting ? NULL : t_http_get_task;
+  if (!restarting) t_http_get_task = NULL;
+  portEXIT_CRITICAL(&snapcast_task_mux);
+  if (restarting) {
+    vTaskDelay(portMAX_DELAY);
+  }
+  if (http != NULL) {
+    vTaskDelete(http);
+  }
   deinit_player();  // ensure this is called after http_task was killed
 
   const esp_partition_t *update_partition =

@@ -35,6 +35,8 @@ typedef struct {
 
 // Function declarations for connection handling
 void setup_network(esp_netif_t** netif);
+// While a restart is under way, wait for it here (holds no lock)
+void park_if_stopping(void);
 
 int connection_get_byte(connection_t* connection, char* buffer);
 
