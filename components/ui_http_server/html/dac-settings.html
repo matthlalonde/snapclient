@@ -830,7 +830,7 @@
         
       } catch (error) {
         console.error('Error updating DAC setting:', error);
-        alert('Failed to update DAC setting. Please try again.');
+        alert(`Failed to update DAC setting: ${error.message || 'please try again'}`);
       }
     }
 

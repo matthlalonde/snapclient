@@ -137,11 +137,12 @@ static esp_err_t send_400(httpd_req_t *req, const char *msg) {
 	return httpd_resp_sendstr(req, msg);
 }
 
-/* The guard for the live tabs' buttons and the player settings: the board's
- * IP address or a LAN name only (a page on another site that points its own
- * name at this board, DNS rebinding, is refused), plus the X-Status-Action
- * header. Another site's page can't send that header, because the CORS
- * answer (set_cors_headers) doesn't allow it. Answers 403 itself on refusal. */
+/* The guard for every request that changes something (settings, restart,
+ * the live tabs' buttons): the board's IP address or a LAN name only (a page
+ * on another site that points its own name at this board, DNS rebinding, is
+ * refused), plus the X-Status-Action header. Another site's page can't send
+ * that header, because the CORS answer (set_cors_headers) doesn't allow it.
+ * Answers 403 itself on refusal. Reads stay open. */
 static bool action_allowed(httpd_req_t *req) {
 	if (!web_rescue_host_allowed(req)) return false;
 	char hdr[4];
@@ -165,7 +166,6 @@ static bool is_player_param(const char *param) {
 
 static esp_err_t player_param_post(httpd_req_t *req, const char *param,
 								   const char *valstr, bool has_value) {
-	if (!action_allowed(req)) return ESP_OK;
 	bool sendspin = strncmp(param, "sendspin_", 9) == 0;
 	bool is_name = strcmp(param, "snapcast_name") == 0 ||
 				   strcmp(param, "sendspin_name") == 0;
@@ -264,6 +264,19 @@ static void set_cors_headers(httpd_req_t *req) {
 	httpd_resp_set_hdr(req, "Access-Control-Max-Age", "86400");
 }
 
+/* For the pages and their scripts (with the CORS headers, 7 of the 8 that
+ * httpd allows):
+ * - no-cache: fetch again after a firmware update, as an old index.js would
+ *   send saves without the X-Status-Action header the board now needs
+ * - framing: only the board's own pages may frame them, so another site can't
+ *   show them invisibly and trick a click onto a real button (which would
+ *   send the header) */
+static void set_page_headers(httpd_req_t *req) {
+	httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+	httpd_resp_set_hdr(req, "X-Frame-Options", "SAMEORIGIN");
+	httpd_resp_set_hdr(req, "Content-Security-Policy", "frame-ancestors 'self'");
+}
+
 /**
  * HTTP get handler - serves index.html from embedded files
  */
@@ -272,6 +285,7 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
 
 	set_cors_headers(req);
 	httpd_resp_set_type(req, "text/html; charset=utf-8");
+	set_page_headers(req);
 
 	/* Send index.html from embedded data (subtract 1 for null terminator) */
 	size_t index_size = index_html_end - index_html_start - 1;
@@ -293,6 +307,7 @@ static esp_err_t root_post_handler(httpd_req_t *req) {
 	char valstr[200] = {0};  // a URL-encoded 63-byte UTF-8 name (3 chars a byte)
 
 	set_cors_headers(req);
+	if (!action_allowed(req)) return ESP_OK;
 
 	memset(&urlBuf, 0, sizeof(URL_t));
 
@@ -304,7 +319,7 @@ static esp_err_t root_post_handler(httpd_req_t *req) {
 	bool value_empty = vkey && (vkey[6] == '\0' || vkey[6] == '&');
 	if (!plen) return send_400(req, "missing or too long param");
 	if (vkey && !value_empty && !vlen) return send_400(req, "value too long");
-	// guarded, and every answer (an empty name too) comes from there
+	// every answer (an empty name too) comes from there
 	if (is_player_param(param))
 		return player_param_post(req, param, valstr, vkey != NULL);
 	// the settings page sends an empty host/port to clear them
@@ -430,6 +445,7 @@ static esp_err_t root_delete_handler(httpd_req_t *req) {
 	char param[32] = {0};
 
 	set_cors_headers(req);
+	if (!action_allowed(req)) return ESP_OK;
 
 	if (!find_key_value("param=", (char *)req->uri, param, sizeof(param))) {
 		ESP_LOGD(TAG, "%s: Invalid delete: expected param=NAME in URI",
@@ -1011,6 +1027,7 @@ static void restart_task(void *pv) {
 static esp_err_t restart_post_handler(httpd_req_t *req) {
 	ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
 	set_cors_headers(req);
+	if (!action_allowed(req)) return ESP_OK;
 
 	event_log_note_restart(EVENT_INFO,
 						   "Restart requested from the settings page");
@@ -1151,6 +1168,7 @@ static esp_err_t post_dac_settings_handler(httpd_req_t *req) {
   ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
   
   set_cors_headers(req);
+  if (!action_allowed(req)) return ESP_OK;
   
 #if CONFIG_DAC_TAS5805M
   // Allocate buffer for request body
@@ -1294,6 +1312,7 @@ static esp_err_t post_eq_settings_handler(httpd_req_t *req) {
   ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
   
   set_cors_headers(req);
+  if (!action_allowed(req)) return ESP_OK;
   
 #if CONFIG_DAC_TAS5805M
   // Allocate buffer for request body
@@ -1370,6 +1389,7 @@ static esp_err_t static_file_handler(httpd_req_t *req) {
 			ESP_LOGD(TAG, "%s: Serving %s (%d bytes)", __func__, req->uri, file_size);
 			
 			httpd_resp_set_type(req, embedded_files[i].content_type);
+			set_page_headers(req);
 			httpd_resp_send(req, (const char *)embedded_files[i].data_start, file_size);
 			
 			return ESP_OK;

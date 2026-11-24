@@ -269,7 +269,13 @@
       
       // Send the update after 300ms of no changes
       debounceTimers[paramKey] = setTimeout(() => {
-        setParameter(paramKey, Math.round(value));
+        setParameter(paramKey, Math.round(value)).then(ok => {
+          // refused: say why and show the device's values again
+          if (!ok) {
+            alert(`Could not save: ${lastSaveError || 'please try again'}`);
+            loadCapabilities();
+          }
+        });
         delete debounceTimers[paramKey];
       }, 300);
     }
@@ -296,7 +302,12 @@
 
       // Use enum_value from the flow object
       if (selectedFlow && selectedFlow.enum_value !== undefined) {
-        await setParameter('dspFlow', selectedFlow.enum_value);
+        if (!(await setParameter('dspFlow', selectedFlow.enum_value))) {
+          // refused: say why and show the device's flow again
+          alert(`Could not change the flow: ${lastSaveError || 'please try again'}`);
+          loadCapabilities();
+          return;
+        }
       }
       
       // Re-render parameters for new flow

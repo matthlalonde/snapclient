@@ -497,7 +497,8 @@
         currentSnapPort = port;
         document.getElementById('save-snap-btn').textContent = 'Save Changes';
       } catch (err) {
-        alert(err.message || 'Failed to save settings');
+        // with the device's reason when it refused
+        alert((err.message || 'Failed to save settings') + (lastSaveError ? `: ${lastSaveError}` : ''));
         saveBtn.disabled = false;
         saveBtn.textContent = 'Save Changes';
       }
@@ -524,11 +525,12 @@
       if (!confirm('Restart device now?')) return;
       try {
         // POST request to restart endpoint
-        fetch('/restart', { method: 'POST' }).then(resp => {
+        // the device refuses changes without this header (see index.js)
+        fetch('/restart', { method: 'POST', headers: { 'X-Status-Action': '1' } }).then(resp => {
           if (resp.ok) {
             alert('Device will restart now');
           } else {
-            alert('Restart request failed');
+            resp.text().then(t => alert(`Restart request failed: ${t.trim() || resp.status}`));
           }
         }).catch(err => {
           console.error('Restart failed', err);
@@ -550,12 +552,14 @@
         deleteParameter('snapserver_use_mdns'),
         deleteParameter('snapserver_host'),
         deleteParameter('snapserver_port')
-      ]).then(() => {
+      ]).then((results) => {
+        // deleteParameter reports a refusal as false, not as an error
+        if (!results.every(Boolean)) throw new Error(lastSaveError);
         // Reload settings from server (which will return defaults)
         location.reload();
       }).catch(error => {
         console.error('Error clearing snapserver settings:', error);
-        alert('Failed to clear settings. Please try again.');
+        alert(`Failed to clear settings: ${error.message || 'please try again'}`);
       });
     }
 
@@ -651,7 +655,7 @@
         }
       } catch (error) {
         console.error('Error saving hostname:', error);
-        alert('Failed to save hostname. Please try again.');
+        alert(`Failed to save hostname: ${lastSaveError || 'please try again'}`);
         saveBtn.disabled = false;
         saveBtn.textContent = 'Save Changes';
       }
@@ -664,12 +668,13 @@
       }
       
       // Clear hostname from NVS using DELETE
-      deleteParameter('hostname').then(() => {
+      deleteParameter('hostname').then((ok) => {
+        if (!ok) throw new Error(lastSaveError);  // refused: see deleteParameter
         // Reload settings from server (which will return default)
         location.reload();
       }).catch(error => {
         console.error('Error clearing hostname:', error);
-        alert('Failed to clear hostname. Please try again.');
+        alert(`Failed to clear hostname: ${error.message || 'please try again'}`);
       });
     }
 

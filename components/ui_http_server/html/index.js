@@ -19,6 +19,21 @@ function getBackendURL() {
 
 const BACKEND_URL = getBackendURL();
 
+// The device's reason when the last save or reset was refused (for example,
+// the page was opened by a name it doesn't accept), for error messages
+let lastSaveError = '';
+
+// An Error with the device's answer text, or the status when there is none
+async function responseError(response) {
+  let text = '';
+  try {
+    text = (await response.text()).trim();
+  } catch (e) {
+    text = '';
+  }
+  return new Error(text ? text.slice(0, 200) : `HTTP error! status: ${response.status}`);
+}
+
 /**
  * Make a GET request to the device
  * @param {string} endpoint - API endpoint path
@@ -45,18 +60,22 @@ async function getRequest(endpoint) {
  */
 async function postRequest(endpoint, data = null) {
   try {
+    // the device only accepts changes with this header, which another
+    // site's page can't send (so a ?backend= page on another origin can't
+    // save either)
     const options = {
-      method: 'POST'
+      method: 'POST',
+      headers: { 'X-Status-Action': '1' }
     };
-    
+
     if (data) {
-      options.headers = { 'Content-Type': 'application/json' };
+      options.headers['Content-Type'] = 'application/json';
       options.body = JSON.stringify(data);
     }
     
     const response = await fetch(BACKEND_URL + endpoint, options);
     if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
+      throw await responseError(response);
     }
     return response;
   } catch (error) {
@@ -97,11 +116,13 @@ async function getParameter(paramKey) {
  * @returns {Promise<boolean>} True if successful
  */
 async function setParameter(paramKey, value) {
+  lastSaveError = '';
   try {
     await postRequest(`/post?param=${paramKey}&value=${encodeURIComponent(value)}`);
     return true;
   } catch (error) {
     console.error(`Error setting parameter ${paramKey}:`, error);
+    lastSaveError = error.message;
     return false;
   }
 }
@@ -112,16 +133,19 @@ async function setParameter(paramKey, value) {
  * @returns {Promise<boolean>} True if successful
  */
 async function deleteParameter(paramKey) {
+  lastSaveError = '';
   try {
     const response = await fetch(`/delete?param=${paramKey}`, {
       method: 'DELETE',
+      headers: { 'X-Status-Action': '1' },  // see postRequest
     });
     if (!response.ok) {
-      throw new Error(`HTTP error ${response.status}`);
+      throw await responseError(response);
     }
     return true;
   } catch (error) {
     console.error(`Error deleting parameter ${paramKey}:`, error);
+    lastSaveError = error.message;
     return false;
   }
 }
