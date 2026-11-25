@@ -1,6 +1,6 @@
 /**
  * @file settings_manager.h
- * @brief Settings manager (hostname, mDNS, snapserver, players)
+ * @brief Settings manager (hostname, mDNS, snapserver, players, MQTT)
  *
  * Provides getters/setters persisted to NVS for:
  * - device hostname
@@ -9,6 +9,8 @@
  * - snapserver port (int)
  * - snapcast and Sendspin on/off flags and display names
  * - whether the snapcast name is still to be sent to the snapserver
+ * - the MQTT broker for Home Assistant
+ * and tells whether a saved setting waits for a restart.
  */
 
 #ifndef __SETTINGS_MANAGER_H__
@@ -23,6 +25,12 @@ extern "C" {
 #include <stdbool.h>
 
 esp_err_t settings_manager_init(void);
+
+/* true while a saved setting that applies at the next restart differs from
+ * what this boot read: hostname, mDNS, snapserver host and port, the player
+ * flags and names, and the MQTT settings. Saving the MQTT password always
+ * counts, whatever its value. Never touches flash; any task. */
+bool settings_restart_needed(void);
 
 /* Hostname */
 esp_err_t settings_get_hostname(char *hostname, size_t max_len);
@@ -44,7 +52,7 @@ esp_err_t settings_set_server_port(int32_t port);
 esp_err_t settings_clear_server_port(void);
 
 /* Player on/off flags, read at boot. Both default to on when nothing is
- * saved. */
+ * saved. The getters read flash once, then answer from RAM. */
 esp_err_t settings_get_snapcast_enabled(bool *enabled);
 esp_err_t settings_set_snapcast_enabled(bool enabled);
 esp_err_t settings_get_sendspin_enabled(bool *enabled);
@@ -75,6 +83,45 @@ esp_err_t settings_set_snapcast_rename_pending(bool pending);
  * sent_name (a name saved meanwhile needs its own rename). */
 esp_err_t settings_clear_snapcast_rename_if(const char *sent_name, bool *cleared);
 
+/* MQTT (Home Assistant), read by mqtt_ha at boot. Missing keys: off, no
+ * host, port 1883, no user, no password, pairing switch off. */
+#define SETTINGS_MQTT_HOST_MAX 128  /* with the NUL */
+#define SETTINGS_MQTT_USER_MAX 64
+#define SETTINGS_MQTT_PASS_MAX 129
+
+/* 1-127 bytes: letters, digits, '.' and '-', no '.' or '-' at either end */
+bool settings_mqtt_host_valid(const char *host);
+/* 1-128 bytes of valid UTF-8, no control characters */
+bool settings_mqtt_pass_valid(const char *pass);
+
+esp_err_t settings_get_mqtt_enabled(bool *on);
+esp_err_t settings_get_mqtt_host(char *host, size_t max_len);  /* "" when none */
+esp_err_t settings_get_mqtt_port(int32_t *port);
+esp_err_t settings_get_mqtt_user(char *user, size_t max_len);  /* "" when none */
+esp_err_t settings_get_mqtt_pass_set(bool *set);
+/* For mqtt_ha only. Never log it; wipe the buffer after use. */
+esp_err_t settings_get_mqtt_pass(char *pass, size_t max_len);
+/* Home Assistant may change Require pairing */
+esp_err_t settings_get_mqtt_pair_sw(bool *allowed);
+
+typedef struct {                 /* NULL / has_* false: keep. "" erases */
+  bool has_on;      bool on;
+  const char *host;              /* stored lowercase */
+  bool has_port;    int32_t port;
+  const char *user;              /* settings_name_valid */
+  const char *pass;
+  bool has_pair_sw; bool pair_sw;
+} settings_mqtt_update_t;
+
+/* Checks every field first (ESP_ERR_INVALID_ARG, nothing written). Then,
+ * under one mutex hold: a host that differs from the saved one (case does
+ * not count) erases the saved password first, and a pass in the same update
+ * is then stored. On (given or saved) with no host (given or saved) is
+ * ESP_ERR_INVALID_ARG. *pass_cleared (may be NULL): the host change erased
+ * the saved password and this update gave no new one. Never logs the
+ * password. */
+esp_err_t settings_set_mqtt(const settings_mqtt_update_t *u, bool *pass_cleared);
+
 /**
  * Get all settings as a JSON string
  * @param json_out Buffer to store JSON string (caller must allocate)
@@ -95,10 +142,12 @@ esp_err_t settings_clear_snapcast_rename_if(const char *sent_name, bool *cleared
  *   "sendspin_available": true,
  *   "dsp_available": false,
  *   "dac_available": false,
- *   "eq_available": false
+ *   "eq_available": false,
+ *   "mqtt_available": true
  * }
+ * No MQTT settings here: /capabilities sends CORS headers.
  * Returns ESP_ERR_INVALID_SIZE when the JSON does not fit (it is never cut
- * short); 1024 bytes always fits.
+ * short); the longest is about 720 bytes, so 1024 always fits.
  */
 esp_err_t settings_get_json(char *json_out, size_t max_len);
 

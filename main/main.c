@@ -77,6 +77,7 @@ static bool spdif_i2s_clock_cb(player_i2s_event_t event, uint32_t sample_rate,
   return false;
 }
 #endif
+#include "mqtt_ha.h"
 #include "ota_server.h"
 #include "player.h"
 #include "sendspin_player.h"
@@ -1456,6 +1457,15 @@ static void snapcast_shutdown_handler(void) {
   }
 }
 
+#if CONFIG_HA_MQTT_ENABLE
+// For mqtt_ha: the board's IPv4 as text, false while it has none
+static bool mqtt_get_ip(char *buf, size_t len) {
+  esp_netif_ip_info_t ip = {0};
+  if (!network_if_get_ip(&ip) || ip.ip.addr == 0) return false;
+  return esp_ip4addr_ntoa(&ip.ip, buf, (int)len) != NULL;
+}
+#endif
+
 /**
  *
  */
@@ -1781,6 +1791,31 @@ void app_main(void) {
     event_log_add(EVENT_SRC_SNAPCAST, EVENT_INFO,
                   "Snapcast is off (General Settings)");
   }
+
+#if CONFIG_HA_MQTT_ENABLE
+  // Home Assistant over MQTT, when General Settings has a broker. Started
+  // after snapcast, so its shutdown handler runs first and can still say
+  // "offline" before the snapcast connection and WiFi go down.
+  mqtt_ha_config_t mqtt_cfg = {
+      .device_name = mdns_hostname,
+      .snapcast_running = snapcast_on,
+      .get_state = status_mqtt_state,
+      .command = status_mqtt_command,
+      .get_ip = mqtt_get_ip,
+  };
+#if CONFIG_SENDSPIN_PLAYER_ENABLE
+  mqtt_cfg.sendspin_built = true;
+  mqtt_cfg.sendspin_running = sendspin_on;
+#endif
+  esp_err_t mqtt_err = mqtt_ha_start(&mqtt_cfg);
+  if (mqtt_err == ESP_ERR_INVALID_STATE) {
+    ESP_LOGI(TAG, "MQTT is off (General Settings)");
+  } else if (mqtt_err != ESP_OK) {
+    ESP_LOGE(TAG, "MQTT did not start: %s", esp_err_to_name(mqtt_err));
+    event_log_add(EVENT_SRC_MQTT, EVENT_ERROR,
+                  "Home Assistant (MQTT) could not start");
+  }
+#endif
 
   //  while (1) {
   //    // audio_event_iface_msg_t msg;

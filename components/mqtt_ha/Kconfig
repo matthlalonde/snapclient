@@ -1,0 +1,24 @@
+menu "Home Assistant (MQTT)"
+
+    config HA_MQTT_ENABLE
+        bool "Publish the board to Home Assistant over MQTT"
+        default n
+        help
+            Publish the board to an MQTT broker with Home Assistant discovery:
+            one device with sensors, switches and buttons, and a short list
+            of commands it accepts. The broker and its login are set on
+            General Settings. Nothing runs, and no RAM is used, until MQTT is
+            turned on there. Plain MQTT only (no TLS), port 1883 by default.
+
+    config HA_MQTT_DISCOVERY_PREFIX
+        string "Home Assistant discovery prefix"
+        default "homeassistant"
+        depends on HA_MQTT_ENABLE
+        help
+            The topic Home Assistant watches for discovery messages. The
+            board also listens on <prefix>/status for Home Assistant's
+            "online" message. That topic is a separate Home Assistant setting
+            (default homeassistant/status): change both if you change this.
+            Missing it only delays updates, since every topic is retained.
+
+endmenu

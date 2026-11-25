@@ -1059,12 +1059,11 @@ static esp_err_t restart_post_handler(httpd_req_t *req) {
 	return ESP_OK;
 }
 
-/* The settings password only comes with rescue mode: it is the way back from
- * a forgotten one (the button, or the rescue access point). */
-#if CONFIG_RESCUE_MODE_ENABLE
+/* JSON bodies that may hold a password (/api/password, /api/mqtt) */
+#if CONFIG_RESCUE_MODE_ENABLE || CONFIG_HA_MQTT_ENABLE
 /* True if the body has a '[' or a second '{' outside strings. Only a flat
- * {"password":"..."} is accepted: cJSON parses nesting by recursion, and a
- * body of [[[[... could run it past the small httpd stack. */
+ * object is accepted: cJSON parses nesting by recursion, and a body of
+ * [[[[... could run it past the small httpd stack. */
 static bool json_nested(const char *s, size_t len) {
 	bool in_string = false;
 	int objects = 0;
@@ -1095,7 +1094,11 @@ static void json_wipe_delete(cJSON *root) {
 	}
 	cJSON_Delete(root);
 }
+#endif
 
+/* The settings password only comes with rescue mode: it is the way back from
+ * a forgotten one (the button, or the rescue access point). */
+#if CONFIG_RESCUE_MODE_ENABLE
 /*
  * POST /api/password, body {"password":"..."}: sets the settings password,
  * "" removes it. The value is never logged, sent back or put in the URL: the
@@ -1172,6 +1175,149 @@ static esp_err_t rescue_post_handler(httpd_req_t *req) {
 		ESP_LOGW(TAG, "%s: failed to create rescue task", __func__);
 	}
 	return ESP_OK;
+}
+#endif
+
+#if CONFIG_HA_MQTT_ENABLE
+/*
+ * GET /api/mqtt: the MQTT card's settings, never the password. Like
+ * /api/status: no CORS headers and the Host check, so other sites' pages
+ * can't read the broker or the user name.
+ */
+static esp_err_t mqtt_get_handler(httpd_req_t *req) {
+	ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
+	if (!web_rescue_host_allowed(req)) return ESP_OK;
+
+	bool on = false, pass_set = false, pair_sw = false;
+	int32_t port = 1883;
+	char host[SETTINGS_MQTT_HOST_MAX];  // checked on save: safe in JSON
+	char user[SETTINGS_MQTT_USER_MAX];
+	char user_json[SETTINGS_MQTT_USER_MAX * 2 + 8];  // json_escape needs room
+	char json[sizeof(host) + sizeof(user_json) + 128];
+	settings_get_mqtt_enabled(&on);
+	settings_get_mqtt_host(host, sizeof(host));
+	settings_get_mqtt_port(&port);
+	settings_get_mqtt_user(user, sizeof(user));
+	settings_get_mqtt_pass_set(&pass_set);
+	settings_get_mqtt_pair_sw(&pair_sw);
+	json_escape(user_json, sizeof(user_json), user);
+#if CONFIG_SENDSPIN_PLAYER_ENABLE
+	const char *pair_sw_available = "true";
+#else
+	const char *pair_sw_available = "false";
+#endif
+	snprintf(json, sizeof(json),
+			 "{\"on\":%s,\"host\":\"%s\",\"port\":%ld,\"user\":\"%s\","
+			 "\"pass_set\":%s,\"pair_sw\":%s,\"pair_sw_available\":%s}",
+			 on ? "true" : "false", host, (long)port, user_json,
+			 pass_set ? "true" : "false", pair_sw ? "true" : "false",
+			 pair_sw_available);
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	httpd_resp_set_type(req, "application/json");
+	return httpd_resp_sendstr(req, json);
+}
+
+/* A field of the POST /api/mqtt body: NULL when absent; a wrong type sets
+ * *bad */
+static const cJSON *mqtt_field(const cJSON *root, const char *name,
+							   cJSON_bool (*type_ok)(const cJSON *const),
+							   const char **bad) {
+	const cJSON *f = cJSON_GetObjectItemCaseSensitive(root, name);
+	if (f == NULL || type_ok(f)) return f;
+	*bad = "a field has the wrong type";
+	return NULL;
+}
+
+/*
+ * POST /api/mqtt, a JSON body with any of "on", "host", "port", "user",
+ * "pass" ("" removes it) and "pair_sw". Guarded like /api/password: the
+ * board's own pages only, the password never logged and wiped from memory.
+ * Answers {"ok":true,"pass_cleared":bool}: a new host erases the saved
+ * password (see settings_set_mqtt).
+ */
+static esp_err_t mqtt_post_handler(httpd_req_t *req) {
+	ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
+	if (!action_allowed(req)) return ESP_OK;
+	if (req->content_len == 0) return send_400(req, "missing body");
+	if (req->content_len > 1024) return send_400(req, "too long");
+
+	char *body = malloc(req->content_len + 1);
+	if (body == NULL) {
+		httpd_resp_set_status(req, "500 Internal Server Error");
+		return httpd_resp_sendstr(req, "out of memory");
+	}
+	size_t got = 0;
+	while (got < req->content_len) {
+		int r = httpd_req_recv(req, body + got, req->content_len - got);
+		if (r <= 0) {
+			mbedtls_platform_zeroize(body, got);
+			free(body);
+			if (r == HTTPD_SOCK_ERR_TIMEOUT) httpd_resp_send_408(req);
+			return ESP_FAIL;  // closes the connection
+		}
+		got += (size_t)r;
+	}
+	body[got] = '\0';
+	cJSON *root = json_nested(body, got) ? NULL : cJSON_ParseWithLength(body, got);
+	mbedtls_platform_zeroize(body, got);
+	free(body);
+	if (!cJSON_IsObject(root)) {
+		json_wipe_delete(root);
+		return send_400(req, "bad JSON");
+	}
+
+	settings_mqtt_update_t u = {0};
+	const char *bad = NULL;
+	const cJSON *f;
+	if ((f = mqtt_field(root, "on", cJSON_IsBool, &bad))) {
+		u.has_on = true;
+		u.on = cJSON_IsTrue(f);
+	}
+	if ((f = mqtt_field(root, "pair_sw", cJSON_IsBool, &bad))) {
+		u.has_pair_sw = true;
+		u.pair_sw = cJSON_IsTrue(f);
+	}
+	if ((f = mqtt_field(root, "port", cJSON_IsNumber, &bad))) {
+		u.has_port = true;
+		u.port = f->valueint;
+		if (f->valuedouble != (double)u.port || u.port < 1 || u.port > 65535)
+			bad = "port: a whole number from 1 to 65535";
+	}
+	if ((f = mqtt_field(root, "host", cJSON_IsString, &bad))) {
+		u.host = f->valuestring;
+		if (u.host[0] && !settings_mqtt_host_valid(u.host))
+			bad = "host: letters, digits, '.' and '-' only, 127 at most";
+	}
+	if ((f = mqtt_field(root, "user", cJSON_IsString, &bad))) {
+		u.user = f->valuestring;
+		if (u.user[0] && !settings_name_valid(u.user))
+			bad = "user: 63 bytes at most, no control characters, no leading "
+				  "or trailing spaces";
+	}
+	if ((f = mqtt_field(root, "pass", cJSON_IsString, &bad))) {
+		u.pass = f->valuestring;
+		if (u.pass[0] && !settings_mqtt_pass_valid(u.pass))
+			bad = "password: 128 bytes at most, no control characters";
+	}
+	if (!u.has_on && !u.has_pair_sw && !u.has_port && !u.host && !u.user &&
+		!u.pass && !bad)
+		bad = "nothing to save";
+
+	bool cleared = false;
+	esp_err_t err = bad ? ESP_OK : settings_set_mqtt(&u, &cleared);
+	json_wipe_delete(root);  // after the save: u points into it
+	if (bad) return send_400(req, bad);
+	if (err == ESP_ERR_INVALID_ARG)
+		return send_400(req, "MQTT needs a broker host while it is on");
+	if (err != ESP_OK) {
+		httpd_resp_set_status(req, "500 Internal Server Error");
+		return httpd_resp_sendstr(req, "could not save the settings");
+	}
+	event_log_add(EVENT_SRC_SYSTEM, EVENT_INFO, "MQTT settings saved");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	httpd_resp_set_type(req, "application/json");
+	return httpd_resp_sendstr(req, cleared ? "{\"ok\":true,\"pass_cleared\":true}"
+										   : "{\"ok\":true,\"pass_cleared\":false}");
 }
 #endif
 
@@ -1630,6 +1776,11 @@ esp_err_t start_server(const char *base_path, int port) {
 #if CONFIG_RESCUE_MODE_ENABLE
 	add_route("/api/password", HTTP_POST, password_post_handler);
 	add_route("/api/rescue", HTTP_POST, rescue_post_handler);
+#endif
+#if CONFIG_HA_MQTT_ENABLE
+	// no preflights: the board's own pages only
+	add_route("/api/mqtt", HTTP_GET, mqtt_get_handler);
+	add_route("/api/mqtt", HTTP_POST, mqtt_post_handler);
 #endif
 
 	add_preflight("/post");

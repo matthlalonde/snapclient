@@ -688,6 +688,9 @@ class Pairing {
 
   // the attempt waits for the pairing-window gesture
   void on_open_window() {
+    if (!waiting()) {
+      requests_++;  // a new request: Home Assistant gets an event
+    }
     prompt_ = true;
     gesture_ = false;
     // event texts end at 95 characters, and a server name can take 45
@@ -776,21 +779,20 @@ class Pairing {
   // Stop: closes the window, and refuses a server still waiting for it. An
   // attempt already under way runs to its end (the library's rule), but a
   // retry after a wrong code then needs a new gesture.
-  void close_window() {
+  void close_window(const char *how) {
     client_->cancel_pairing_window();
     if (pairing_now()) {
       event_log_addf(EVENT_SRC_SENDSPIN, EVENT_INFO,
                      "Pairing window closed; %s may still finish pairing",
                      display_name(attempt_id_).c_str());
     } else if (window_until_us_ != 0 || waiting()) {
-      event_log_add(EVENT_SRC_SENDSPIN, EVENT_INFO,
-                    waiting() ? "Pairing refused (settings page)"
-                              : "Pairing window closed (settings page)");
+      event_log_addf(EVENT_SRC_SENDSPIN, EVENT_INFO, "%s (%s)",
+                     waiting() ? "Pairing refused" : "Pairing window closed", how);
     }
     close_window_state();
   }
 
-  void set_require(bool require) {
+  void set_require(bool require, const char *how) {
     const bool unpaired = !require;
     const bool changed = client_->is_unpaired_access_enabled() != unpaired;
     // turning it off closes the connections of unpaired servers
@@ -804,10 +806,10 @@ class Pairing {
       app_erase(kUnpairedKey);
     }
     if (changed) {
-      event_log_add(EVENT_SRC_SENDSPIN, EVENT_INFO,
-                    require ? "Pairing required: unpaired servers are refused "
-                              "(settings page)"
-                            : "Unpaired servers may play (settings page)");
+      event_log_addf(EVENT_SRC_SENDSPIN, EVENT_INFO, "%s (%s)",
+                     require ? "Pairing required: unpaired servers are refused"
+                             : "Unpaired servers may play",
+                     how);
     }
   }
 
@@ -902,6 +904,7 @@ class Pairing {
       e.connected = info && info->server_id == id;
     }
     p.paired_count = static_cast<uint8_t>(count);
+    p.pair_requests = requests_;
     taskENTER_CRITICAL(&g_pair_mux);
     g_pair = p;
     taskEXIT_CRITICAL(&g_pair_mux);
@@ -1044,6 +1047,7 @@ class Pairing {
   int64_t window_until_us_ = 0;
   std::string window_for_;  // the server it is bound to, "" = unbound
   uint8_t window_failures_ = 0;
+  uint32_t requests_ = 0;  // servers that started waiting for the window
   uint8_t led_ = 0;
   int64_t next_refresh_us_ = 0;
   int64_t next_publish_us_ = 0;
@@ -1503,13 +1507,25 @@ void run_command(uint8_t cmd, Pairing *pairing, NvsStore *store) {
       pairing->open_window("settings page");
       break;
     case SENDSPIN_CMD_STOP_PAIRING:
-      pairing->close_window();
+      pairing->close_window("settings page");
       break;
     case SENDSPIN_CMD_REQUIRE_PAIRING:
-      pairing->set_require(true);
+      pairing->set_require(true, "settings page");
       break;
     case SENDSPIN_CMD_ALLOW_UNPAIRED:
-      pairing->set_require(false);
+      pairing->set_require(false, "settings page");
+      break;
+    case SENDSPIN_CMD_ALLOW_PAIRING_HA:
+      pairing->open_window("Home Assistant");
+      break;
+    case SENDSPIN_CMD_STOP_PAIRING_HA:
+      pairing->close_window("Home Assistant");
+      break;
+    case SENDSPIN_CMD_REQUIRE_PAIRING_HA:
+      pairing->set_require(true, "Home Assistant");
+      break;
+    case SENDSPIN_CMD_ALLOW_UNPAIRED_HA:
+      pairing->set_require(false, "Home Assistant");
       break;
     case SENDSPIN_CMD_FORGET_PAIRED:
       forget_paired(pairing, store);

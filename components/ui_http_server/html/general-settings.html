@@ -54,7 +54,8 @@
       font-style: italic;
     }
 
-    .setting-control input[type="text"] {
+    .setting-control input[type="text"],
+    .setting-control input[type="password"] {
       width: 100%;
       padding: 10px 12px;
       font-size: 16px;
@@ -64,7 +65,8 @@
       transition: border-color 0.3s;
     }
 
-    .setting-control input[type="text"]:focus {
+    .setting-control input[type="text"]:focus,
+    .setting-control input[type="password"]:focus {
       outline: none;
       border-color: #007bff;
       box-shadow: 0 0 0 3px rgba(0,123,255,0.1);
@@ -72,6 +74,7 @@
 
     .button-group {
       display: flex;
+      flex-wrap: wrap;
       gap: 10px;
       margin-top: 15px;
     }
@@ -204,6 +207,15 @@
       border-top: 1px solid #e9ecef;
     }
 
+    /* MQTT card: a gap above each field's title; live state one per line */
+    #mqtt input + label {
+      margin-top: 12px;
+    }
+
+    #mqtt-live {
+      white-space: pre-line;
+    }
+
     /* Sendspin pairing: live state from /api/status */
     #sendspin-pairing {
       margin-top: 20px;
@@ -325,6 +337,7 @@
     let currentSendspinOn = true;
     let currentSendspinName = '';
     let sendspinAvailable = false;  // built in (not in the no-PSRAM build)
+    let mqttAvailable = false;  // MQTT built in; its card loads GET /api/mqtt
 
     // Load current settings
     async function loadSettings() {
@@ -349,8 +362,10 @@
         currentSnapName = typeof capabilities.snapcast_name === 'string' ? capabilities.snapcast_name : '';
         currentSendspinName = typeof capabilities.sendspin_name === 'string' ? capabilities.sendspin_name : '';
         sendspinAvailable = capabilities.sendspin_available === true;
+        mqttAvailable = capabilities.mqtt_available === true;
 
         renderUI();
+        if (mqttAvailable) loadMqtt();
       } catch (error) {
         console.error('Error loading settings:', error);
         showError('Error loading settings. Please refresh the page.', app);
@@ -402,11 +417,14 @@
       html += '</div>';
       html += '</div>'; // .setting-control.setting-section
       html += playersHtml();
+      if (mqttAvailable) {
+        html += '<div class="setting-control" id="mqtt"><label>Home Assistant (MQTT)</label><div class="description">Loading&hellip;</div></div>';
+      }
       html += '</div>';
 
       // Info message
       html += '<div class="info">';
-      html += '<strong>Note:</strong> After changing the hostname, the Snapserver settings or the players, you will need to restart the device for the changes to take effect.';
+      html += '<strong>Note:</strong> After changing the hostname, the Snapserver settings, the players or MQTT, you will need to restart the device for the changes to take effect.';
       html += '</div>';
       
       app.innerHTML = html;
@@ -505,19 +523,11 @@
     }
 
     function updateRestartButton() {
-      // Enable/disable restart buttons based on needsRestart flag
-      // This flag is only set by successful save operations
-      const restartBtnHostname = document.getElementById('restart-btn-hostname');
-      if (restartBtnHostname) {
-        restartBtnHostname.disabled = !needsRestart;
-      }
-      const restartBtnSnap = document.getElementById('restart-btn-snap');
-      if (restartBtnSnap) {
-        restartBtnSnap.disabled = !needsRestart;
-      }
-      const restartBtnPlayers = document.getElementById('restart-btn-players');
-      if (restartBtnPlayers) {
-        restartBtnPlayers.disabled = !needsRestart;
+      // each card's Restart button: on once a save (or the device) says a
+      // restart is needed
+      for (const id of ['hostname', 'snap', 'players', 'mqtt']) {
+        const btn = document.getElementById(`restart-btn-${id}`);
+        if (btn) btn.disabled = !needsRestart;
       }
     }
 
@@ -733,9 +743,11 @@
     }
 
     // [param, value, label, apply] for each field that differs from the board
-    function playerChanges(want) {
+    // all: also the on/off boxes that look unchanged, so a save stores what the
+    // card shows even if Home Assistant switched a player meanwhile
+    function playerChanges(want, all = false) {
       const changes = [];
-      if (want.snapOn !== currentSnapOn) {
+      if (all || want.snapOn !== currentSnapOn) {
         changes.push(['snapcast_enabled', want.snapOn ? '1' : '0', 'Snapcast on/off', () => { currentSnapOn = want.snapOn; }]);
       }
       if (want.snapName !== currentSnapName) {
@@ -745,7 +757,7 @@
         }]);
       }
       if (sendspinAvailable) {
-        if (want.ssOn !== currentSendspinOn) {
+        if (all || want.ssOn !== currentSendspinOn) {
           changes.push(['sendspin_enabled', want.ssOn ? '1' : '0', 'Sendspin on/off', () => { currentSendspinOn = want.ssOn; }]);
         }
         if (want.ssName !== currentSendspinName) {
@@ -799,11 +811,15 @@
         playersSaving || !ok || playerChanges(want).length === 0;
     }
 
-    function setPlayersMsg(text, kind) {
-      const msg = document.getElementById('players-msg');
+    function setMsg(id, text, kind) {
+      const msg = document.getElementById(id);
       msg.textContent = text;
       msg.className = kind;
       msg.hidden = !text;
+    }
+
+    function setPlayersMsg(text, kind) {
+      setMsg('players-msg', text, kind);
     }
 
     function handlePlayersChange() {
@@ -813,38 +829,44 @@
 
     // These settings are guarded on the board: same origin (not BACKEND_URL)
     // and the X-Status-Action header, which another site's page can't send.
-    // Returns null when saved, else the board's reason.
-    async function postPlayerSetting(param, value) {
+    // Gives { text } (the answer) when saved, else { error } (the reason).
+    async function guardedPost(url, headers, body) {
       const controller = new AbortController();
       const abort = setTimeout(() => controller.abort(), 5000);
       try {
-        const response = await fetch(`/post?param=${param}&value=${encodeURIComponent(value)}`, {
+        const response = await fetch(url, {
           method: 'POST',
-          headers: noLoginPrompt({ 'X-Status-Action': '1' }),
+          headers: noLoginPrompt(Object.assign({ 'X-Status-Action': '1' }, headers)),
           cache: 'no-store',
           signal: controller.signal,
+          body,
         });
-        if (response.ok) return null;
-        if (response.status === 401) return LOGIN_NEEDED;
+        if (response.status === 401) return { error: LOGIN_NEEDED };
         let text = '';
         try {
           text = (await response.text()).trim();
         } catch (e) {
           text = '';
         }
-        return text ? text.slice(0, 200) : `HTTP ${response.status}`;
+        if (response.ok) return { text };
+        return { error: text ? text.slice(0, 200) : `HTTP ${response.status}` };
       } catch (error) {
-        return "couldn't reach the device";
+        return { error: "couldn't reach the device" };
       } finally {
         clearTimeout(abort);
       }
     }
 
+    // null when saved, else the board's reason
+    async function postPlayerSetting(param, value) {
+      return (await guardedPost(`/post?param=${param}&value=${encodeURIComponent(value)}`)).error || null;
+    }
+
     async function savePlayers() {
       const want = readPlayers();
       if (playersSaving || !validatePlayers(want)) return;
-      const changes = playerChanges(want);
-      if (changes.length === 0) return;
+      if (playerChanges(want).length === 0) return;
+      const changes = playerChanges(want, true);
       const turnsOneOff = (currentSnapOn && !want.snapOn)
         || (sendspinAvailable && currentSendspinOn && !want.ssOn);
       if (turnsOneOff && !want.snapOn && !(sendspinAvailable && want.ssOn)) {
@@ -885,6 +907,189 @@
         setPlayersMsg(failed, 'error');
       }
       updatePlayersSave();
+    }
+
+    // ---- MQTT (Home Assistant): settings from GET /api/mqtt, saved with
+    // POST /api/mqtt; the live part comes with the pairing poller ----
+
+    let mqtt = null;       // as saved on the board
+    let mqttLive = null;   // the latest /api/status mqtt section
+    let mqttSaving = false;
+
+    async function loadMqtt(msg = '', kind = '') {
+      const desc = document.querySelector('#mqtt .description');
+      if (liveDataBlocked()) {
+        desc.textContent = 'Only on the page the device itself serves.';
+        return;
+      }
+      try {
+        const r = await fetchJson('/api/mqtt');
+        if (!r.ok || !r.body) {
+          throw new Error(r.status === 401 ? LOGIN_NEEDED
+            : r.status === 403 ? 'open this page by the device\'s IP address or a local name' : `HTTP ${r.status}`);
+        }
+        mqtt = r.body;
+        renderMqtt();
+        setMsg('mqtt-msg', msg, kind);
+      } catch (error) {
+        desc.textContent = `Can't load the MQTT settings: ${error.message}`;
+      }
+    }
+
+    function renderMqtt() {
+      const m = mqtt;
+      const field = (id, label, type, value, attrs) =>
+        `<label for="${id}">${label}</label><input type="${type}" id="${id}" value="${escapeHtml(value)}" ${attrs} oninput="mqttChange()">`;
+      const check = (id, on, text) =>
+        `<label class="switch-row"><input type="checkbox" id="${id}" onchange="mqttChange()"${on ? ' checked' : ''}> ${text}</label>`;
+      let h = '<label>Home Assistant (MQTT)</label>';
+      h += '<div class="description">Shows this device in Home Assistant, through your MQTT broker.</div>';
+      h += check('mqtt-on', m.on, 'Publish to Home Assistant');
+      h += field('mqtt-host', 'Broker host', 'text', m.host, 'placeholder="e.g. 192.168.1.10 or mqtt.lan" maxlength="127"');
+      h += field('mqtt-port', 'Broker port', 'text', m.port, 'placeholder="1883" maxlength="5" inputmode="numeric"');
+      h += field('mqtt-user', 'User name', 'text', m.user, 'maxlength="63" autocomplete="off"');
+      h += field('mqtt-pass', 'Password', 'password', '', `maxlength="128" autocomplete="new-password" placeholder="${m.pass_set ? 'saved (leave empty to keep it)' : 'not set'}"`);
+      if (m.pass_set) h += check('mqtt-pass-rm', false, 'Remove the saved password');
+      if (m.pair_sw_available) {
+        h += check('mqtt-pair-sw', m.pair_sw, 'Home Assistant may change Require pairing <span class="hint">(anyone who can publish to the broker can then switch it)</span>');
+      }
+      h += '<div id="mqtt-check" class="validation-error"></div>';
+      h += '<div id="mqtt-live" class="hint"></div>';
+      h += '<div class="button-group">';
+      h += '<button class="btn btn-primary" id="save-mqtt-btn" onclick="saveMqtt()" disabled>Save Changes</button>';
+      h += '<button class="btn btn-danger" id="restart-btn-mqtt" onclick="requestRestart()" style="background-color:#e74c3c;" disabled>Restart</button>';
+      h += '<button class="btn btn-danger" id="mqtt-remove" onclick="removeMqtt()" disabled>Remove from Home Assistant</button>';
+      h += '</div>';
+      h += '<div id="mqtt-msg" role="status" hidden></div>';
+      h += '<div class="hint">Changes apply after a restart. The broker password crosses the network unencrypted (port 1883). Anything that can publish to the broker can use the buttons and switches this device shows in Home Assistant.</div>';
+      document.getElementById('mqtt').innerHTML = h;
+      updateRestartButton();
+      renderMqttLive({ mqtt: mqttLive });
+    }
+
+    // what the card asks for now
+    function readMqtt() {
+      const el = id => document.getElementById(id);
+      const port = el('mqtt-port').value.trim();
+      return {
+        on: el('mqtt-on').checked,
+        host: el('mqtt-host').value.trim().toLowerCase(),
+        port: port === '' ? 1883 : Number(port),
+        user: el('mqtt-user').value.trim(),
+        pass: el('mqtt-pass').value,
+        passRemove: !!el('mqtt-pass-rm') && el('mqtt-pass-rm').checked,
+        pairSw: el('mqtt-pair-sw') ? el('mqtt-pair-sw').checked : mqtt.pair_sw,
+      };
+    }
+
+    // the fields that differ from the board, as POST /api/mqtt takes them
+    function mqttChanges(want) {
+      const c = {};
+      for (const k of ['on', 'host', 'port', 'user']) {
+        if (want[k] !== mqtt[k]) c[k] = want[k];
+      }
+      if (want.pairSw !== mqtt.pair_sw) c.pair_sw = want.pairSw;
+      if (want.pass) c.pass = want.pass;
+      else if (want.passRemove) c.pass = '';
+      return c;
+    }
+
+    // as the board checks text: UTF-8 bytes, no control characters
+    function textError(label, s, max) {
+      if (/[\u0000-\u001f\u007f-\u009f]/.test(s)) return `${label} cannot contain control characters`;
+      if (new TextEncoder().encode(s).length > max) return `${label} must be ${max} bytes or less`;
+      return null;
+    }
+
+    function mqttError(want) {
+      if (want.host && !/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(want.host)) {
+        return 'Broker host: letters, digits, "." and "-" only, not first or last';
+      }
+      if (want.on && !want.host) return 'Publishing needs a broker host';
+      if (!Number.isInteger(want.port) || want.port < 1 || want.port > 65535) {
+        return 'Port must be a number between 1 and 65535';
+      }
+      return textError('User name', want.user, 63) || textError('Password', want.pass, 128);
+    }
+
+    function updateMqttSave() {
+      const want = readMqtt();
+      const error = mqttError(want);
+      const warn = mqtt.pass_set && want.host !== mqtt.host && !want.pass
+        ? 'A new broker host erases the saved password: type it again if the broker needs one.' : '';
+      document.getElementById('mqtt-check').textContent = error || warn;
+      document.getElementById('save-mqtt-btn').disabled =
+        mqttSaving || !!error || Object.keys(mqttChanges(want)).length === 0;
+    }
+
+    function mqttChange() {
+      setMsg('mqtt-msg', '', '');
+      updateMqttSave();
+    }
+
+    async function saveMqtt() {
+      const want = readMqtt();
+      const changes = mqttChanges(want);
+      if (mqttSaving || mqttError(want) || Object.keys(changes).length === 0) return;
+      const btn = document.getElementById('save-mqtt-btn');
+      mqttSaving = true;
+      btn.disabled = true;
+      btn.textContent = 'Saving...';
+      const r = await guardedPost('/api/mqtt', { 'Content-Type': 'application/json' }, JSON.stringify(changes));
+      mqttSaving = false;
+      if (r.error) {
+        btn.textContent = 'Save Changes';
+        setMsg('mqtt-msg', `Not saved: ${r.error}`, 'error');
+        updateMqttSave();
+        return;
+      }
+      let cleared = false;
+      try {
+        cleared = JSON.parse(r.text).pass_cleared === true;
+      } catch (e) {
+        cleared = false;
+      }
+      Object.assign(mqtt, { on: want.on, host: want.host, port: want.port, user: want.user, pair_sw: want.pairSw });
+      if ('pass' in changes) mqtt.pass_set = changes.pass !== '';
+      else if (cleared) mqtt.pass_set = false;
+      needsRestart = true;
+      renderMqtt();  // empties the password field
+      setMsg('mqtt-msg', 'Saved. Restart the device to apply the changes.'
+        + (cleared ? ' The saved password was erased because the broker host changed.' : ''), 'success');
+    }
+
+    async function removeMqtt() {
+      if (!confirm('Remove this device and its entities from Home Assistant? MQTT turns off; '
+        + 'turn it on again here to bring the device back.')) return;
+      document.getElementById('mqtt-remove').disabled = true;
+      try {
+        if (await statusAction('mqtt-ha-remove')) {
+          // the device turns MQTT off itself: show its saved settings again
+          setTimeout(() => loadMqtt('Removed from Home Assistant. MQTT is off from the next restart.', 'success'), 1500);
+        } else {
+          setMsg('mqtt-msg', 'Not now: the device is not connected to the broker.', 'error');
+        }
+      } catch (error) {
+        setMsg('mqtt-msg', error.status === 401 ? LOGIN_NEEDED : "Couldn't reach the device.", 'error');
+      }
+      pairPoller.soon();
+    }
+
+    function renderMqttLive(st) {
+      const m = st.mqtt || null;
+      mqttLive = m;
+      const box = document.getElementById('mqtt-live');
+      if (!box) return;
+      const lines = [];
+      if (m) {
+        lines.push(`State: ${m.state || 'unknown'}${has(m.last_error) ? ` (${m.last_error})` : ''}`);
+        if (has(m.topic) && has(m.device_id)) {
+          lines.push(`Topic: ${m.topic}. The broker login must be allowed to publish to ${m.topic}/# and `
+            + `homeassistant/device/${m.device_id}/config, and to subscribe to ${m.topic}/cmd and homeassistant/status.`);
+        }
+      }
+      box.textContent = lines.join('\n');
+      document.getElementById('mqtt-remove').disabled = !(m && m.connected);
     }
 
     // Initialize on page load
@@ -962,7 +1167,7 @@
         document.getElementById('require-pairing').checked = !!p.required;
       }
       document.getElementById('require-from').textContent =
-        p.required_from === 'page' ? '(changed on this page)' : '(build setting)';
+        p.required_from === 'page' ? '(saved setting)' : '(build setting)';
 
       maybeScrollToPairing();
     }
@@ -1037,7 +1242,15 @@
       pairAction(on ? 'sendspin-require-pairing' : 'sendspin-allow-unpaired', '');
     });
 
-    const pairPoller = new StatusPoller(renderPairing, state => {
+    const pairPoller = new StatusPoller(st => {
+      renderPairing(st);
+      renderMqttLive(st);
+      // a restart is due (a save here, or Home Assistant switched a player)
+      if (st.device && st.device.restart_needed && !needsRestart) {
+        needsRestart = true;
+        updateRestartButton();
+      }
+    }, state => {
       document.getElementById('sendspin-pairing').classList.toggle('stale', state.stale);
       // /api/status answers only to the device's IP or a LAN name
       const wrong = document.getElementById('pair-wrong-host');

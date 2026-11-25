@@ -34,6 +34,7 @@ typedef enum {
   EVENT_SRC_WIFI,
   EVENT_SRC_SNAPCAST,
   EVENT_SRC_SENDSPIN,
+  EVENT_SRC_MQTT,
 } event_source_t;
 
 typedef enum {

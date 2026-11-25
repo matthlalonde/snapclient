@@ -26,9 +26,30 @@ static const char *NVS_KEY_SS_ON = "ss_on";             // int32 0/1, missing = 
 static const char *NVS_KEY_SNAP_NAME = "snap_name";     // string, missing = hostname
 static const char *NVS_KEY_SS_NAME = "ss_name";         // string, missing = hostname
 static const char *NVS_KEY_SNAP_RENAME = "snap_rename"; // int32, 1 = still to send to the snapserver
+static const char *NVS_KEY_MQTT_ON = "mqtt_on";         // int32 0/1, missing = off
+static const char *NVS_KEY_MQTT_HOST = "mqtt_host";     // string, lowercase, missing = none
+static const char *NVS_KEY_MQTT_PORT = "mqtt_port";     // int32, missing = 1883
+static const char *NVS_KEY_MQTT_USER = "mqtt_user";     // string, missing = none
+static const char *NVS_KEY_MQTT_PASS = "mqtt_pass";     // string, missing = none; never logged
+static const char *NVS_KEY_MQTT_PAIR_SW = "mqtt_pair_sw"; // int32 0/1, missing = off
+#define MQTT_PORT_DEFAULT 1883
 
 // Mutex for thread-safe NVS access
 static SemaphoreHandle_t hostname_mutex = NULL;
+
+// The player flags, kept in RAM after the first read (read every second for
+// Home Assistant). NOT_READ until then.
+#define NOT_READ INT32_MIN
+static int32_t snap_on_cache = NOT_READ;
+static int32_t ss_on_cache = NOT_READ;
+
+// Hashes of the settings that apply at the next restart: as this boot read
+// them, and as saved now (see settings_restart_needed). The MQTT password is
+// not hashed: comparing it would tell a page whether a guess matches. Any
+// write of it sets pass_changed instead.
+static uint32_t boot_hash;
+static volatile uint32_t saved_hash;
+static volatile bool pass_changed;
 
 /**
  * @brief Validate hostname according to RFC 1123
@@ -77,6 +98,62 @@ static void default_hostname(char *hostname, size_t max_len) {
 #endif
 }
 
+static uint32_t fnv1a(uint32_t hash, const void *data, size_t len) {
+    const uint8_t *p = data;
+    while (len--) hash = (hash ^ *p++) * 16777619u;
+    return hash;
+}
+
+/* A hash of the saved settings that apply at the next restart, missing keys
+ * as their defaults (so saving a default changes nothing). Reads flash: call
+ * with the mutex held, from a task with an internal-RAM stack. */
+static uint32_t restart_hash(void) {
+    const struct { const char *key; int32_t def; } ints[] = {
+#ifdef CONFIG_SNAPSERVER_USE_MDNS
+        {NVS_KEY_MDNS, 1},
+#else
+        {NVS_KEY_MDNS, 0},
+#endif
+#ifdef CONFIG_SNAPSERVER_PORT
+        {NVS_KEY_SERVER_PORT, CONFIG_SNAPSERVER_PORT},
+#else
+        {NVS_KEY_SERVER_PORT, 0},
+#endif
+        {NVS_KEY_SNAP_ON, 1}, {NVS_KEY_SS_ON, 1}, {NVS_KEY_MQTT_ON, 0},
+        {NVS_KEY_MQTT_PORT, MQTT_PORT_DEFAULT}, {NVS_KEY_MQTT_PAIR_SW, 0},
+    };
+    const char *strs[] = {NVS_KEY_HOSTNAME, NVS_KEY_SERVER_HOST, NVS_KEY_SNAP_NAME,
+                          NVS_KEY_SS_NAME, NVS_KEY_MQTT_HOST, NVS_KEY_MQTT_USER};
+    uint32_t hash = 2166136261u;
+    nvs_handle_t h;
+    bool open = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK;
+    for (size_t i = 0; i < sizeof(ints) / sizeof(ints[0]); i++) {
+        int32_t v;
+        if (!open || nvs_get_i32(h, ints[i].key, &v) != ESP_OK) v = ints[i].def;
+        hash = fnv1a(hash, &v, sizeof(v));
+    }
+    char buf[SETTINGS_MQTT_HOST_MAX];  // the longest of these strings
+    for (size_t i = 0; i < sizeof(strs) / sizeof(strs[0]); i++) {
+        size_t len = sizeof(buf);
+        if (!open || nvs_get_str(h, strs[i], buf, &len) != ESP_OK) {
+            buf[0] = '\0';
+            if (strs[i] == NVS_KEY_HOSTNAME) default_hostname(buf, sizeof(buf));
+#ifdef CONFIG_SNAPSERVER_HOST
+            if (strs[i] == NVS_KEY_SERVER_HOST) {
+                snprintf(buf, sizeof(buf), "%s", CONFIG_SNAPSERVER_HOST);
+            }
+#endif
+        }
+        hash = fnv1a(hash, buf, strlen(buf) + 1);  // the NUL ends each field
+    }
+    if (open) nvs_close(h);
+    return hash;
+}
+
+bool settings_restart_needed(void) {
+    return saved_hash != boot_hash || pass_changed;
+}
+
 esp_err_t settings_manager_init(void) {
     if (hostname_mutex == NULL) {
         hostname_mutex = xSemaphoreCreateMutex();
@@ -84,6 +161,9 @@ esp_err_t settings_manager_init(void) {
             ESP_LOGE(TAG, "%s: Failed to create mutex", __func__);
             return ESP_ERR_NO_MEM;
         }
+        // what this boot reads (main reads the settings right after this)
+        boot_hash = restart_hash();
+        saved_hash = boot_hash;
     }
     
     ESP_LOGI(TAG, "%s: Snapclient manager initialized", __func__);
@@ -171,6 +251,7 @@ esp_err_t settings_set_hostname(const char *hostname) {
     }
 
     nvs_close(nvs_handle);
+    if (err == ESP_OK) saved_hash = restart_hash();
     xSemaphoreGive(hostname_mutex);
 
     if (err == ESP_OK) {
@@ -214,6 +295,7 @@ esp_err_t settings_clear_hostname(void) {
     }
 
     nvs_close(nvs_handle);
+    if (err == ESP_OK) saved_hash = restart_hash();
     xSemaphoreGive(hostname_mutex);
 
     return err;
@@ -269,6 +351,7 @@ esp_err_t settings_set_mdns_enabled(bool enabled) {
     err = nvs_set_i32(h, NVS_KEY_MDNS, enabled ? 1 : 0);
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
+    if (err == ESP_OK) saved_hash = restart_hash();
     xSemaphoreGive(hostname_mutex);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "%s: mdns saved: %d", __func__, enabled ? 1 : 0);
@@ -307,6 +390,7 @@ esp_err_t settings_clear_mdns_enabled(void) {
     }
 
     nvs_close(h);
+    if (err == ESP_OK) saved_hash = restart_hash();
     xSemaphoreGive(hostname_mutex);
     return err;
 }
@@ -372,6 +456,7 @@ esp_err_t settings_set_server_host(const char *host) {
     }
 
     nvs_close(h);
+    if (err == ESP_OK) saved_hash = restart_hash();
     xSemaphoreGive(hostname_mutex);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "%s: server_host saved: %s", __func__, host ? host : "(erased)");
@@ -437,6 +522,7 @@ esp_err_t settings_set_server_port(int32_t port) {
     if (err == ESP_OK) err = nvs_commit(h);
 
     nvs_close(h);
+    if (err == ESP_OK) saved_hash = restart_hash();
     xSemaphoreGive(hostname_mutex);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "%s: server_port saved: %ld", __func__, (long)port);
@@ -475,15 +561,21 @@ esp_err_t settings_clear_server_port(void) {
     }
 
     nvs_close(h);
+    if (err == ESP_OK) saved_hash = restart_hash();
     xSemaphoreGive(hostname_mutex);
     return err;
 }
 
-/* An int32 0/1 flag; `def` when the key is missing or unreadable, and on an
- * error return */
-static esp_err_t get_flag(const char *key, bool def, bool *value) {
+/* An int32; `def` when the key is missing or unreadable, and on an error
+ * return. cache (may be NULL): filled by the first good read, then served
+ * from RAM without the mutex or flash; set_flag keeps it current. */
+static esp_err_t get_i32(const char *key, int32_t def, int32_t *value, int32_t *cache) {
     if (!value) return ESP_ERR_INVALID_ARG;
     *value = def;
+    if (cache && *cache != NOT_READ) {
+        *value = *cache;
+        return ESP_OK;
+    }
     if (!hostname_mutex) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(hostname_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
 
@@ -494,17 +586,28 @@ static esp_err_t get_flag(const char *key, bool def, bool *value) {
         err = nvs_get_i32(h, key, &v);
         nvs_close(h);
         if (err == ESP_OK) {
-            *value = (v != 0);
+            *value = v;
         } else if (err != ESP_ERR_NVS_NOT_FOUND) {
             ESP_LOGW(TAG, "%s: %s: NVS read error: %s", __func__, key, esp_err_to_name(err));
         }
     }
-    ESP_LOGD(TAG, "%s: %s=%d", __func__, key, *value ? 1 : 0);
+    // a missing namespace or key is a good read too: the default
+    if (cache && (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND)) *cache = *value;
+    ESP_LOGD(TAG, "%s: %s=%ld", __func__, key, (long)*value);
     xSemaphoreGive(hostname_mutex);
     return ESP_OK;
 }
 
-static esp_err_t set_flag(const char *key, bool value) {
+/* An int32 0/1 flag, see get_i32 */
+static esp_err_t get_flag(const char *key, bool def, bool *value, int32_t *cache) {
+    if (!value) return ESP_ERR_INVALID_ARG;
+    int32_t v;
+    esp_err_t err = get_i32(key, def ? 1 : 0, &v, cache);
+    *value = (v != 0);
+    return err;
+}
+
+static esp_err_t set_flag(const char *key, bool value, int32_t *cache) {
     if (!hostname_mutex) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(hostname_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
 
@@ -514,6 +617,10 @@ static esp_err_t set_flag(const char *key, bool value) {
         err = nvs_set_i32(h, key, value ? 1 : 0);
         if (err == ESP_OK) err = nvs_commit(h);
         nvs_close(h);
+    }
+    if (err == ESP_OK) {
+        if (cache) *cache = value ? 1 : 0;
+        saved_hash = restart_hash();
     }
     xSemaphoreGive(hostname_mutex);
     if (err == ESP_OK) {
@@ -570,6 +677,7 @@ static esp_err_t set_name(const char *key, const char *name) {
         if (err == ESP_OK) err = nvs_commit(h);
         nvs_close(h);
     }
+    if (err == ESP_OK) saved_hash = restart_hash();
     xSemaphoreGive(hostname_mutex);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "%s: %s saved: %s", __func__, key, erase ? "(erased)" : name);
@@ -588,13 +696,9 @@ static esp_err_t get_display_name(const char *key, char *name, size_t max_len) {
     return ESP_OK;
 }
 
-bool settings_name_valid(const char *name) {
-    if (!name) return false;
-    size_t len = strlen(name);
-    if (len == 0 || len > 63) return false;
-    if (name[0] == ' ' || name[len - 1] == ' ') return false;
-
-    const unsigned char *s = (const unsigned char *)name;
+/* Valid UTF-8 with no control characters */
+static bool text_valid(const char *text, size_t len) {
+    const unsigned char *s = (const unsigned char *)text;
     size_t i = 0;
     while (i < len) {
         unsigned char c = s[i];
@@ -629,21 +733,49 @@ bool settings_name_valid(const char *name) {
     return true;
 }
 
-/* Player on/off flags */
+bool settings_name_valid(const char *name) {
+    if (!name) return false;
+    size_t len = strlen(name);
+    if (len == 0 || len > 63) return false;
+    if (name[0] == ' ' || name[len - 1] == ' ') return false;
+    return text_valid(name, len);
+}
+
+bool settings_mqtt_pass_valid(const char *pass) {
+    if (!pass) return false;
+    size_t len = strlen(pass);
+    return len > 0 && len < SETTINGS_MQTT_PASS_MAX && text_valid(pass, len);
+}
+
+bool settings_mqtt_host_valid(const char *host) {
+    if (!host) return false;
+    size_t len = strlen(host);
+    if (len == 0 || len >= SETTINGS_MQTT_HOST_MAX) return false;
+    if (host[0] == '.' || host[0] == '-' || host[len - 1] == '.' || host[len - 1] == '-') {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        char c = host[i];
+        if (!isalnum((unsigned char)c) && c != '.' && c != '-') return false;
+    }
+    return true;
+}
+
+/* Player on/off flags, served from RAM after the first read */
 esp_err_t settings_get_snapcast_enabled(bool *enabled) {
-    return get_flag(NVS_KEY_SNAP_ON, true, enabled);
+    return get_flag(NVS_KEY_SNAP_ON, true, enabled, &snap_on_cache);
 }
 
 esp_err_t settings_set_snapcast_enabled(bool enabled) {
-    return set_flag(NVS_KEY_SNAP_ON, enabled);
+    return set_flag(NVS_KEY_SNAP_ON, enabled, &snap_on_cache);
 }
 
 esp_err_t settings_get_sendspin_enabled(bool *enabled) {
-    return get_flag(NVS_KEY_SS_ON, true, enabled);
+    return get_flag(NVS_KEY_SS_ON, true, enabled, &ss_on_cache);
 }
 
 esp_err_t settings_set_sendspin_enabled(bool enabled) {
-    return set_flag(NVS_KEY_SS_ON, enabled);
+    return set_flag(NVS_KEY_SS_ON, enabled, &ss_on_cache);
 }
 
 /* Player names */
@@ -673,11 +805,11 @@ esp_err_t settings_get_sendspin_display_name(char *name, size_t max_len) {
 
 /* Snapcast name still to be sent to the snapserver */
 esp_err_t settings_get_snapcast_rename_pending(bool *pending) {
-    return get_flag(NVS_KEY_SNAP_RENAME, false, pending);
+    return get_flag(NVS_KEY_SNAP_RENAME, false, pending, NULL);
 }
 
 esp_err_t settings_set_snapcast_rename_pending(bool pending) {
-    return set_flag(NVS_KEY_SNAP_RENAME, pending);
+    return set_flag(NVS_KEY_SNAP_RENAME, pending, NULL);
 }
 
 esp_err_t settings_clear_snapcast_rename_if(const char *sent_name, bool *cleared) {
@@ -710,6 +842,116 @@ esp_err_t settings_clear_snapcast_rename_if(const char *sent_name, bool *cleared
     }
     xSemaphoreGive(hostname_mutex);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "%s: %s", __func__, esp_err_to_name(err));
+    }
+    return err;
+}
+
+/* MQTT (Home Assistant) */
+esp_err_t settings_get_mqtt_enabled(bool *on) {
+    return get_flag(NVS_KEY_MQTT_ON, false, on, NULL);
+}
+
+esp_err_t settings_get_mqtt_host(char *host, size_t max_len) {
+    return get_name(NVS_KEY_MQTT_HOST, host, max_len);
+}
+
+esp_err_t settings_get_mqtt_port(int32_t *port) {
+    return get_i32(NVS_KEY_MQTT_PORT, MQTT_PORT_DEFAULT, port, NULL);
+}
+
+esp_err_t settings_get_mqtt_user(char *user, size_t max_len) {
+    return get_name(NVS_KEY_MQTT_USER, user, max_len);
+}
+
+esp_err_t settings_get_mqtt_pass(char *pass, size_t max_len) {
+    return get_name(NVS_KEY_MQTT_PASS, pass, max_len);
+}
+
+esp_err_t settings_get_mqtt_pair_sw(bool *allowed) {
+    return get_flag(NVS_KEY_MQTT_PAIR_SW, false, allowed, NULL);
+}
+
+esp_err_t settings_get_mqtt_pass_set(bool *set) {
+    if (!set) return ESP_ERR_INVALID_ARG;
+    *set = false;
+    if (!hostname_mutex) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(hostname_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
+    if (err == ESP_OK) {
+        nvs_type_t type;
+        *set = nvs_find_key(h, NVS_KEY_MQTT_PASS, &type) == ESP_OK;  // no value read
+        nvs_close(h);
+    }
+    xSemaphoreGive(hostname_mutex);
+    return (err == ESP_ERR_NVS_NOT_FOUND) ? ESP_OK : err;
+}
+
+/* "" erases the key */
+static esp_err_t put_str(nvs_handle_t h, const char *key, const char *value) {
+    esp_err_t err = value[0] ? nvs_set_str(h, key, value) : nvs_erase_key(h, key);
+    return (err == ESP_ERR_NVS_NOT_FOUND) ? ESP_OK : err;
+}
+
+esp_err_t settings_set_mqtt(const settings_mqtt_update_t *u, bool *pass_cleared) {
+    if (pass_cleared) *pass_cleared = false;
+    if (!u) return ESP_ERR_INVALID_ARG;
+    // check everything before writing anything
+    char host[SETTINGS_MQTT_HOST_MAX] = "";
+    if (u->host && u->host[0]) {
+        if (!settings_mqtt_host_valid(u->host)) return ESP_ERR_INVALID_ARG;
+        for (size_t i = 0; u->host[i]; i++) host[i] = (char)tolower((unsigned char)u->host[i]);
+    }
+    if ((u->has_port && (u->port < 1 || u->port > 65535)) ||
+        (u->user && u->user[0] && !settings_name_valid(u->user)) ||
+        (u->pass && u->pass[0] && !settings_mqtt_pass_valid(u->pass))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!hostname_mutex) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(hostname_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    bool erased = false;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        char saved[SETTINGS_MQTT_HOST_MAX];
+        size_t len = sizeof(saved);
+        int32_t on = 0;
+        if (nvs_get_str(h, NVS_KEY_MQTT_HOST, saved, &len) != ESP_OK) saved[0] = '\0';
+        if (nvs_get_i32(h, NVS_KEY_MQTT_ON, &on) != ESP_OK) on = 0;
+        if (u->has_on) on = u->on;
+        if (on && !(u->host ? host : saved)[0]) {
+            err = ESP_ERR_INVALID_ARG;  // on needs a broker
+        } else if (u->host && strcmp(host, saved) != 0) {  // both lowercase
+            // a new broker must not get the old password: erase it first, so
+            // a power cut in between can't leave it with the new host
+            err = nvs_erase_key(h, NVS_KEY_MQTT_PASS);
+            erased = (err == ESP_OK);
+            if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
+            if (err == ESP_OK) err = put_str(h, NVS_KEY_MQTT_HOST, host);
+        }
+        if (erased || u->pass) pass_changed = true;  // even if the write fails
+        if (err == ESP_OK && u->pass) err = put_str(h, NVS_KEY_MQTT_PASS, u->pass);
+        if (err == ESP_OK && u->user) err = put_str(h, NVS_KEY_MQTT_USER, u->user);
+        if (err == ESP_OK && u->has_port) err = nvs_set_i32(h, NVS_KEY_MQTT_PORT, u->port);
+        if (err == ESP_OK && u->has_on) err = nvs_set_i32(h, NVS_KEY_MQTT_ON, u->on ? 1 : 0);
+        if (err == ESP_OK && u->has_pair_sw) {
+            err = nvs_set_i32(h, NVS_KEY_MQTT_PAIR_SW, u->pair_sw ? 1 : 0);
+        }
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+        saved_hash = restart_hash();  // a failed write may have saved part of it
+    }
+    xSemaphoreGive(hostname_mutex);
+
+    // the password stays erased unless this update saved a new one
+    if (pass_cleared) *pass_cleared = erased && !(u->pass && u->pass[0]);
+    if (err == ESP_OK) {
+        // names only: never the password
+        ESP_LOGI(TAG, "%s: saved%s%s", __func__, u->pass ? " (mqtt_pass)" : "",
+                 erased ? " (new host: old mqtt_pass erased)" : "");
+    } else if (err != ESP_ERR_INVALID_ARG) {
         ESP_LOGE(TAG, "%s: %s", __func__, esp_err_to_name(err));
     }
     return err;
@@ -791,6 +1033,13 @@ esp_err_t settings_get_json(char *json_out, size_t max_len) {
     cJSON_AddBoolToObject(root, "eq_available", true);
 #else
     cJSON_AddBoolToObject(root, "eq_available", false);
+#endif
+
+    // MQTT built in; its settings come from GET /api/mqtt (no CORS there)
+#if CONFIG_HA_MQTT_ENABLE
+    cJSON_AddBoolToObject(root, "mqtt_available", true);
+#else
+    cJSON_AddBoolToObject(root, "mqtt_available", false);
 #endif
 
     // Render to string

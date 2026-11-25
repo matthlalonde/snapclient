@@ -100,6 +100,8 @@ typedef struct {
                              // the start of its key)
   uint8_t paired_count;
   sendspin_paired_server_t paired[SENDSPIN_MAX_PAIRED];
+  uint32_t pair_requests;    // goes up by one each time a server starts
+                             // waiting for the window
 } sendspin_pairing_t;
 
 /**
@@ -115,6 +117,11 @@ typedef enum {
   SENDSPIN_CMD_REQUIRE_PAIRING,       // refuse unpaired servers (saved)
   SENDSPIN_CMD_ALLOW_UNPAIRED,        // let unpaired servers play (saved)
   SENDSPIN_CMD_FORGET_PAIRED,         // delete every pairing, then restart
+  // the same as the page ones, logged as from Home Assistant
+  SENDSPIN_CMD_ALLOW_PAIRING_HA,
+  SENDSPIN_CMD_STOP_PAIRING_HA,
+  SENDSPIN_CMD_REQUIRE_PAIRING_HA,
+  SENDSPIN_CMD_ALLOW_UNPAIRED_HA,
 } sendspin_cmd_t;
 
 /**

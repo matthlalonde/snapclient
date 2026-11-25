@@ -269,6 +269,8 @@ const char *event_log_source_name(uint8_t source) {
       return "snapcast";
     case EVENT_SRC_SENDSPIN:
       return "sendspin";
+    case EVENT_SRC_MQTT:
+      return "mqtt";
     default:
       return "system";
   }

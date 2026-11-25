@@ -5,7 +5,9 @@
 //   device    host name, firmware, OTA state and update slot, uptime, last
 //             reset, WiFi, memory, stack headroom
 //   events    a change counter for the event log (GET /api/events)
-// It also records the start-up and WiFi events in the event log.
+//   mqtt      the Home Assistant (MQTT) link, when built in
+// It also records the start-up and WiFi events in the event log, and gives
+// Home Assistant the same state words and its commands (mqtt_ha).
 // Each section runs on the web server's task and only copies snapshots that
 // the audio tasks publish, so a page refresh never waits on audio work.
 
@@ -34,6 +36,7 @@
 #include "player.h"
 #include "sdkconfig.h"
 #include "sendspin_player.h"
+#include "settings_manager.h"
 #include "snapcast_status.h"
 #include "snapserver_rename.h"
 #include "ui_http_server.h"
@@ -85,6 +88,17 @@ static const char *ota_state_text(const esp_partition_t *running) {
   }
 }
 
+// A saved setting waits for a restart, or MQTT stopped until one ("Remove
+// from Home Assistant": turning MQTT back on doesn't restart it)
+static bool restart_needed(void) {
+#if CONFIG_HA_MQTT_ENABLE
+  mqtt_ha_status_t m;
+  mqtt_ha_get_status(&m);
+  if (m.stopped) return true;
+#endif
+  return settings_restart_needed();
+}
+
 static void device_section(cJSON *o) {
   const esp_app_desc_t *app = esp_app_get_description();
   const esp_partition_t *running = esp_ota_get_running_partition();
@@ -121,6 +135,7 @@ static void device_section(cJSON *o) {
   cJSON_AddNumberToObject(o, "uptime_s", seconds_since(0, esp_timer_get_time()));
   cJSON_AddStringToObject(o, "reset_reason",
                           event_log_reset_reason_text(esp_reset_reason()));
+  cJSON_AddBoolToObject(o, "restart_needed", restart_needed());
 
   esp_netif_ip_info_t ip = {0};
   if (network_if_get_ip(&ip) && ip.ip.addr != 0) {
@@ -415,24 +430,42 @@ void web_rescue_button_pressed(void) {
 }
 #endif
 
+typedef enum { OUTPUT_IDLE, OUTPUT_SNAPCAST, OUTPUT_SENDSPIN } output_owner_t;
+
+// Which player owns the I2S output; leaves both snapshots in *ss and *sc
+static output_owner_t output_owner(sendspin_status_t *ss,
+                                   snapcast_status_t *sc) {
+  sendspin_player_get_status(ss);  // ss->running is false when it fails
+  snapcast_status_get(sc);
+  if (ss->running && ss->output_open) return OUTPUT_SENDSPIN;
+  if (!player_output_released() && sc->player == SNAPCAST_PLAYER_PLAYING) {
+    return OUTPUT_SNAPCAST;
+  }
+  return OUTPUT_IDLE;
+}
+
+static const char *const source_words[] = {"Idle", "Snapcast", "Sendspin"};
+
+const char *status_output_source(void) {
+  sendspin_status_t ss;
+  snapcast_status_t sc;
+  return source_words[output_owner(&ss, &sc)];
+}
+
 // Which source owns the I2S output right now, and at what format
 static void output_section(cJSON *o) {
+  static const char *const names[] = {"none", "snapcast", "sendspin"};
   sendspin_status_t ss;
-  if (sendspin_player_get_status(&ss) && ss.output_open) {
-    cJSON_AddStringToObject(o, "source", "sendspin");
+  snapcast_status_t sc;
+  output_owner_t owner = output_owner(&ss, &sc);
+  cJSON_AddStringToObject(o, "source", names[owner]);
+  if (owner == OUTPUT_SENDSPIN) {
     cJSON_AddNumberToObject(o, "sample_rate", ss.output_rate);
     cJSON_AddNumberToObject(o, "bits", ss.output_bits);
-    return;
-  }
-  snapcast_status_t sc;
-  snapcast_status_get(&sc);
-  if (!player_output_released() && sc.player == SNAPCAST_PLAYER_PLAYING) {
-    cJSON_AddStringToObject(o, "source", "snapcast");
+  } else if (owner == OUTPUT_SNAPCAST) {
     cJSON_AddNumberToObject(o, "sample_rate", sc.output_rate);
     cJSON_AddNumberToObject(o, "bits", sc.output_bits);
-    return;
   }
-  cJSON_AddStringToObject(o, "source", "none");
 }
 
 // Roaming state, and the access points of this network from the last scan
@@ -476,12 +509,8 @@ static bool scan_action(void) { return wifi_roam_request_scan(); }
 // Audio is playing: roaming waits for a pause (a move costs seconds)
 static bool audio_busy(void) {
   sendspin_status_t ss;
-  if (sendspin_player_get_status(&ss) && ss.output_open) {
-    return true;
-  }
   snapcast_status_t sc;
-  snapcast_status_get(&sc);
-  return !player_output_released() && sc.player == SNAPCAST_PLAYER_PLAYING;
+  return output_owner(&ss, &sc) != OUTPUT_IDLE;
 }
 #endif
 
@@ -490,6 +519,207 @@ static void events_section(cJSON *o) {
   cJSON_AddNumberToObject(o, "boot", event_log_boot());
   cJSON_AddNumberToObject(o, "changes", event_log_last_change());
 }
+
+#if CONFIG_HA_MQTT_ENABLE
+// ---- Home Assistant (mqtt_ha). The state and the commands run on
+// mqtt_ha's task only; the mqtt section on the web server's task. ----
+
+static bool saved_on(esp_err_t (*get)(bool *), bool fallback) {
+  bool on;
+  return get(&on) == ESP_OK ? on : fallback;
+}
+
+// the saved Sendspin switch (cached by settings_manager)
+static bool sendspin_saved_on(void) {
+#if CONFIG_SENDSPIN_PLAYER_ENABLE
+  return saved_on(settings_get_sendspin_enabled, true);
+#else
+  return false;
+#endif
+}
+
+#if CONFIG_SENDSPIN_PLAYER_ENABLE
+static sendspin_pairing_t s_pairing;  // ~900 bytes: not on the task's stack
+
+// The pairing snapshot, or NULL while Sendspin isn't running. A running
+// player always has a code: an empty one is the snapshot before the first.
+static const sendspin_pairing_t *pairing_snapshot(void) {
+  return sendspin_player_get_pairing(&s_pairing) && s_pairing.code[0] != '\0'
+             ? &s_pairing
+             : NULL;
+}
+#endif
+
+// The Status tab's badge words (status.html render()), in the same order
+static const char *snapcast_word(const snapcast_status_t *sc, bool handed_over) {
+  if (!snapcast_enabled) return "off";
+  if (handed_over) return "paused for Sendspin";
+  if (!sc->connected) return "not connected";
+  if (sc->player == SNAPCAST_PLAYER_PLAYING) return "playing";
+  return "connected";
+}
+
+#if CONFIG_SENDSPIN_PLAYER_ENABLE
+static const char *sendspin_word(const sendspin_status_t *ss,
+                                 const sendspin_pairing_t *p) {
+  if (!sendspin_enabled) return "off";
+  if (!ss->running) return "not running";
+  if (p != NULL && p->waiting) return "asks to pair";
+  if (ss->output_open) return "playing";
+  if (ss->output_failed) return "output error";
+  if (ss->connected) return "connected";
+  return "waiting for a server";
+}
+
+static const char *pairing_word(const sendspin_pairing_t *p) {
+  if (p == NULL) return "closed";
+  if (p->waiting) return "server waiting";
+  if (p->pairing_now) return "pairing";
+  if (p->window_open) return "open";
+  return "closed";
+}
+#endif
+
+void status_mqtt_state(mqtt_ha_state_t *out) {
+  sendspin_status_t ss;
+  snapcast_status_t sc;
+  memset(out, 0, sizeof(*out));
+  output_owner_t owner = output_owner(&ss, &sc);
+  strlcpy(out->source, source_words[owner], sizeof(out->source));
+
+  const bool handed_over = player_output_released();
+  strlcpy(out->snapcast, snapcast_word(&sc, handed_over), sizeof(out->snapcast));
+  out->snapcast_connected = snapcast_enabled && sc.connected;
+  out->snapcast_saved_on = saved_on(settings_get_snapcast_enabled, true);
+  out->interruptions = snapcast_enabled ? sc.hard_resyncs : 0;
+  out->sync_valid = snapcast_enabled && sc.sync_valid && !handed_over &&
+                    sc.player == SNAPCAST_PLAYER_PLAYING;
+  if (out->sync_valid) out->sync_error_us = sc.sync_error_us;
+
+#if CONFIG_SENDSPIN_PLAYER_ENABLE
+  const sendspin_pairing_t *p = ss.running ? pairing_snapshot() : NULL;
+  strlcpy(out->sendspin, sendspin_word(&ss, p), sizeof(out->sendspin));
+  strlcpy(out->pairing, pairing_word(p), sizeof(out->pairing));
+  out->sendspin_connected = ss.running && ss.connected;
+  if (p != NULL) {
+    out->require_pairing = p->require_pairing;
+    out->pair_requests = p->pair_requests;
+    if (p->waiting || p->pairing_now) {
+      // a server with no known name shows as "server " + the start of its key
+      bool keyed =
+          strncmp(p->server, "server ", 7) == 0 && strlen(p->server) == 15;
+      strlcpy(out->pair_server, keyed ? "unknown server" : p->server,
+              sizeof(out->pair_server));
+    }
+  }
+#endif
+  out->sendspin_saved_on = sendspin_saved_on();
+  out->restart_needed = restart_needed();
+}
+
+#if CONFIG_SENDSPIN_PLAYER_ENABLE
+static bool sendspin_from_ha(sendspin_cmd_t cmd) {
+  if (sendspin_player_command(cmd)) return true;
+  event_log_add(EVENT_SRC_MQTT, EVENT_WARN,
+                "Pairing command from Home Assistant dropped: Sendspin is off "
+                "or busy");
+  return false;
+}
+
+// Like the page's warning: requiring pairing now would lock out the server
+// in use, and Music Assistant doesn't reconnect by itself
+static bool require_from_ha(void) {
+  const sendspin_pairing_t *p = pairing_snapshot();
+  sendspin_status_t ss;
+  if (p != NULL && p->paired_count == 0) {
+    event_log_add(EVENT_SRC_MQTT, EVENT_WARN,
+                  "Require pairing from Home Assistant refused: no server has "
+                  "paired");
+    return false;
+  }
+  if (sendspin_player_get_status(&ss) && ss.connected && !ss.paired) {
+    event_log_add(EVENT_SRC_MQTT, EVENT_WARN,
+                  "Require pairing from Home Assistant refused: an unpaired server "
+                  "is connected");
+    return false;
+  }
+  return sendspin_from_ha(SENDSPIN_CMD_REQUIRE_PAIRING_HA);
+}
+#endif
+
+// A player switch: saved now, applied at the next restart (like the page)
+static bool player_from_ha(bool sendspin, bool on) {
+  esp_err_t (*get)(bool *) =
+      sendspin ? settings_get_sendspin_enabled : settings_get_snapcast_enabled;
+  if (saved_on(get, !on) == on) return true;  // nothing to write or log
+  esp_err_t err = sendspin ? settings_set_sendspin_enabled(on)
+                           : settings_set_snapcast_enabled(on);
+  if (err != ESP_OK) {
+    event_log_add(EVENT_SRC_MQTT, EVENT_ERROR,
+                  "Could not save a player switch from Home Assistant");
+    return false;
+  }
+  event_log_addf(EVENT_SRC_MQTT, EVENT_INFO,
+                 "%s player turned %s from Home Assistant; applies after a "
+                 "restart",
+                 sendspin ? "Sendspin" : "Snapcast", on ? "on" : "off");
+  if (!on && !saved_on(settings_get_snapcast_enabled, true) &&
+      !sendspin_saved_on()) {
+    event_log_add(EVENT_SRC_MQTT, EVENT_WARN,
+                  "No player is left on: nothing plays after a restart");
+  }
+  return true;
+}
+
+// mqtt_ha has checked retain, rate limits, the restart guard and the
+// Require pairing permission
+bool status_mqtt_command(mqtt_ha_cmd_t cmd) {
+  switch (cmd) {
+    case MQTT_HA_CMD_RESTART:
+      event_log_note_restart(EVENT_INFO, "Restart requested from Home Assistant");
+      esp_restart();
+    case MQTT_HA_CMD_SNAPCAST_ON:
+    case MQTT_HA_CMD_SNAPCAST_OFF:
+      return player_from_ha(false, cmd == MQTT_HA_CMD_SNAPCAST_ON);
+#if CONFIG_SENDSPIN_PLAYER_ENABLE
+    case MQTT_HA_CMD_SENDSPIN_ON:
+    case MQTT_HA_CMD_SENDSPIN_OFF:
+      return player_from_ha(true, cmd == MQTT_HA_CMD_SENDSPIN_ON);
+    case MQTT_HA_CMD_PAIR_ALLOW:
+      return sendspin_from_ha(SENDSPIN_CMD_ALLOW_PAIRING_HA);
+    case MQTT_HA_CMD_PAIR_STOP:
+      return sendspin_from_ha(SENDSPIN_CMD_STOP_PAIRING_HA);
+    case MQTT_HA_CMD_REQUIRE_PAIRING_ON:
+      return require_from_ha();
+    case MQTT_HA_CMD_REQUIRE_PAIRING_OFF:
+      return sendspin_from_ha(SENDSPIN_CMD_ALLOW_UNPAIRED_HA);
+#endif
+    default:
+      return false;  // Sendspin isn't built in
+  }
+}
+
+// The MQTT card (General Settings and the Status tab). Never the login.
+static void mqtt_section(cJSON *o) {
+  mqtt_ha_status_t m;
+  mqtt_ha_get_status(&m);
+  cJSON_AddBoolToObject(o, "enabled", m.enabled);
+  cJSON_AddStringToObject(o, "state", m.state != NULL ? m.state : "off");
+  cJSON_AddBoolToObject(o, "connected", m.connected);
+  if (m.broker[0] != '\0') cJSON_AddStringToObject(o, "broker", m.broker);
+  // the broker's access rules must allow this topic base
+  cJSON_AddStringToObject(o, "topic", m.topic);
+  cJSON_AddStringToObject(o, "device_id", m.device_id);
+  // also when off: says why the client could not start
+  cJSON_AddStringToObject(o, "last_error", m.last_error);
+  if (!m.enabled) return;
+  if (m.connected) cJSON_AddNumberToObject(o, "connected_s", m.connected_s);
+  cJSON_AddNumberToObject(o, "connects", m.connects);
+  cJSON_AddBoolToObject(o, "removed", m.removed);
+  cJSON_AddNumberToObject(o, "stack_free", m.stack_free);
+  cJSON_AddNumberToObject(o, "mqtt_stack_free", m.mqtt_stack_free);
+}
+#endif
 
 void status_events_boot(void) {
   esp_reset_reason_t rr = esp_reset_reason();
@@ -662,6 +892,10 @@ void status_sections_init(const status_identity_t *id) {
   ui_http_add_status_section("device", device_section);
   ui_http_add_status_section("wifi", wifi_section);
   ui_http_add_status_section("events", events_section);
+#if CONFIG_HA_MQTT_ENABLE
+  ui_http_add_status_section("mqtt", mqtt_section);
+  ui_http_add_action("mqtt-ha-remove", mqtt_ha_remove);
+#endif
 #if CONFIG_WIFI_ROAMING
   ui_http_add_action("wifi-scan", scan_action);
   wifi_roam_set_busy_cb(audio_busy);

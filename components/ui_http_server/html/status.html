@@ -51,6 +51,10 @@
       margin-top: 4px;
     }
 
+    #restart-note {
+      margin: 0 0 20px 0;
+    }
+
     /* a server asks to pair: the pairing controls are on General Settings */
     .card .pair-prompt {
       display: flex;
@@ -64,6 +68,8 @@
 </head>
 <body>
   <div id="offline" class="warning" role="status">Can't reach the device. Retrying&hellip;</div>
+  <div id="restart-note" class="warning" role="status" hidden>Saved settings wait for a restart.
+    <a href="general-settings.html" id="restart-open">General Settings</a></div>
 
   <div class="cards">
     <div class="card" id="card-now">
@@ -96,6 +102,11 @@
         <button class="btn btn-secondary" id="art-toggle" type="button">Hide cover art</button>
         <span class="hint">This browser loads it from the server's link.</span>
       </div>
+    </div>
+
+    <div class="card" id="card-mqtt" hidden>
+      <h2>MQTT <span class="badge" id="badge-mqtt"></span></h2>
+      <dl id="rows-mqtt"></dl>
     </div>
   </div>
 
@@ -287,6 +298,12 @@
         ['Listening on', s => has(s.port) ? `port ${s.port}` : null],
         ['Client ID', s => s.client_id || null],
       ],
+      mqtt: [
+        ['Broker', m => m.broker || null],
+        ['Topic', m => m.topic || null],
+        ['Last error', m => m.last_error || null],
+        ['Connected for', m => m.connected ? duration(m.connected_s) : null],
+      ],
     };
 
     // Cover art, loaded by this browser from the URL the Sendspin server
@@ -407,6 +424,12 @@
       renderCard('sendspin', ssOff ? OFF_ROWS : ROWS.sendspin, ss);
       renderPairPrompt(ss);
 
+      // the state is the badge: green connected, grey off, yellow the rest
+      const mq = st.mqtt;
+      if (mq) setBadge('badge-mqtt', mq.state || 'unknown', mq.connected ? 'ok' : mq.enabled ? 'warn' : 'off');
+      renderCard('mqtt', ROWS.mqtt, mq);
+      document.getElementById('restart-note').hidden = !(st.device && st.device.restart_needed);
+
       document.getElementById('updated').textContent =
         `Updated ${new Date().toLocaleTimeString()}`;
     }
@@ -414,6 +437,10 @@
     document.getElementById('art-toggle').addEventListener('click', () => setArtEnabled(artSwitchedOff));
     document.getElementById('pair-open').addEventListener('click', () =>
       openPage('general-settings.html', 'sendspin-pairing'));
+    document.getElementById('restart-open').addEventListener('click', e => {
+      e.preventDefault();
+      openPage('general-settings.html');
+    });
     updateArtToggle();
 
     const poller = new StatusPoller(render, showReachability);

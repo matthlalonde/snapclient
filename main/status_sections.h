@@ -2,6 +2,11 @@
 
 #include <stdbool.h>
 
+#include "sdkconfig.h"
+#if CONFIG_HA_MQTT_ENABLE
+#include "mqtt_ha.h"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -18,7 +23,8 @@ typedef struct {
 
 /**
  * Register the settings page's live sections (GET /api/status):
- * output, snapcast, sendspin and device. The strings in `id` are copied.
+ * output, snapcast, sendspin, device, wifi, events and mqtt (when built in).
+ * The strings in `id` are copied.
  */
 void status_sections_init(const status_identity_t *id);
 
@@ -29,6 +35,19 @@ void status_sections_init(const status_identity_t *id);
  */
 void status_events_boot(void);
 void status_events_start(void);
+
+/** Who owns the audio output now: "Snapcast", "Sendspin" or "Idle". Any task. */
+const char *status_output_source(void);
+
+#if CONFIG_HA_MQTT_ENABLE
+/**
+ * Home Assistant's callbacks (mqtt_ha_config_t), for mqtt_ha's task only.
+ * status_mqtt_state() fills the same words the Status tab shows;
+ * status_mqtt_command() runs a command and logs why when it refuses one.
+ */
+void status_mqtt_state(mqtt_ha_state_t *out);
+bool status_mqtt_command(mqtt_ha_cmd_t cmd);
+#endif
 
 #ifdef __cplusplus
 }
