@@ -332,7 +332,7 @@
       
       try {
         // Fetch all settings from capabilities endpoint
-        const response = await fetch('/capabilities?tab=general');
+        const response = await fetch('/capabilities?tab=general', { headers: noLoginPrompt() });
         if (!response.ok) {
           throw new Error(`HTTP error! status: ${response.status}`);
         }
@@ -526,9 +526,11 @@
       try {
         // POST request to restart endpoint
         // the device refuses changes without this header (see index.js)
-        fetch('/restart', { method: 'POST', headers: { 'X-Status-Action': '1' } }).then(resp => {
+        fetch('/restart', { method: 'POST', headers: noLoginPrompt({ 'X-Status-Action': '1' }) }).then(resp => {
           if (resp.ok) {
             alert('Device will restart now');
+          } else if (resp.status === 401) {
+            alert(`Restart request failed: ${LOGIN_NEEDED}`);
           } else {
             resp.text().then(t => alert(`Restart request failed: ${t.trim() || resp.status}`));
           }
@@ -818,11 +820,12 @@
       try {
         const response = await fetch(`/post?param=${param}&value=${encodeURIComponent(value)}`, {
           method: 'POST',
-          headers: { 'X-Status-Action': '1' },
+          headers: noLoginPrompt({ 'X-Status-Action': '1' }),
           cache: 'no-store',
           signal: controller.signal,
         });
         if (response.ok) return null;
+        if (response.status === 401) return LOGIN_NEEDED;
         let text = '';
         try {
           text = (await response.text()).trim();
@@ -986,7 +989,8 @@
           setPairNote(done);
         }
       } catch (error) {
-        setPairNote(failText || "Couldn't reach the device.");
+        // a 401 means the settings password changed: say so, not "unreachable"
+        setPairNote(error.status === 401 ? LOGIN_NEEDED : (failText || "Couldn't reach the device."));
       }
       // the Sendspin task applies it within a moment: show the result
       setTimeout(() => {
@@ -1037,11 +1041,13 @@
       document.getElementById('sendspin-pairing').classList.toggle('stale', state.stale);
       // /api/status answers only to the device's IP or a LAN name
       const wrong = document.getElementById('pair-wrong-host');
-      wrong.textContent = state.wrongHost
-        ? 'Sendspin pairing shows only when this page is opened by the device\'s IP address '
-          + `or a local name (name.local, name.lan, …), not ${location.hostname}.`
-        : '';
-      wrong.hidden = !state.wrongHost;
+      wrong.textContent = state.login
+        ? LOGIN_NEEDED
+        : state.wrongHost
+          ? 'Sendspin pairing shows only when this page is opened by the device\'s IP address '
+            + `or a local name (name.local, name.lan, …), not ${location.hostname}.`
+          : '';
+      wrong.hidden = !state.wrongHost && !state.login;
     });
     // /api/status can't be read from a page served elsewhere (?backend=)
     if (!liveDataBlocked()) pairPoller.start();

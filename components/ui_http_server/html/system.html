@@ -57,6 +57,38 @@
       font-variant-numeric: tabular-nums;
     }
 
+    /* Settings password */
+    .pw-state {
+      font-size: 14px;
+      margin: 0 0 14px 0;
+    }
+
+    .pw-field {
+      display: block;
+      font-size: 14px;
+      color: #666;
+      margin-bottom: 10px;
+    }
+
+    .pw-field input {
+      display: block;
+      width: 100%;
+      max-width: 320px;
+      margin-top: 4px;
+      padding: 8px 10px;
+      font-size: 16px;
+      font-family: Arial, sans-serif;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      box-sizing: border-box;
+    }
+
+    .pw-field input:focus {
+      outline: none;
+      border-color: #007bff;
+      box-shadow: 0 0 0 3px rgba(0,123,255,0.1);
+    }
+
     /* Recent events */
     .events {
       list-style: none;
@@ -178,6 +210,32 @@
         <button class="btn btn-secondary" id="scan-btn" type="button">Scan for access points</button>
         <span class="hint" id="scan-note"></span>
       </div>
+    </div>
+
+    <div class="card" id="card-password" hidden>
+      <h2>Settings password <span class="badge" id="badge-password"></span></h2>
+      <div class="pw-state" id="pw-state"></div>
+      <form id="pw-form" novalidate>
+        <!-- for password managers: the login's user name -->
+        <input type="text" name="username" autocomplete="username" value="admin" hidden readonly>
+        <label class="pw-field">New password
+          <input type="password" id="pw-new" autocomplete="new-password" spellcheck="false">
+        </label>
+        <label class="pw-field">Repeat it
+          <input type="password" id="pw-repeat" autocomplete="new-password" spellcheck="false">
+        </label>
+        <div id="pw-note" role="status" hidden></div>
+        <div class="actions">
+          <button class="btn btn-primary" id="pw-save" type="submit">Set password</button>
+          <button class="btn btn-danger" id="pw-remove" type="button" hidden>Remove password</button>
+        </div>
+      </form>
+      <div class="hint">8 to 64 characters: letters, digits, spaces and the
+        symbols of an English keyboard. These pages are plain HTTP, so the
+        password crosses your network readably: use one you use nowhere else.
+        Forgot it? Put the device in rescue mode and hold its button for 10 s,
+        or join its rescue WiFi (snapclient-…) and open http://192.168.4.1,
+        which doesn't ask for it and offers to remove it.</div>
     </div>
 
     <div class="card" id="card-events" hidden>
@@ -324,7 +382,7 @@
           scanRequestedAt = null;
         }
       } catch (error) {
-        note.textContent = "Couldn't reach the device.";
+        note.textContent = error.status === 401 ? LOGIN_NEEDED : "Couldn't reach the device.";
         scanRequestedAt = null;
       }
       poller.soon();
@@ -678,13 +736,23 @@
       return new Promise(resolve => setTimeout(resolve, ms));
     }
 
+    // the last waitFor stopped at a 401 (a settings password this browser
+    // has no login for)
+    let waitLogin = false;
+
     // GET /api/status until accept(reply) gives a value or time runs out.
     // onDown() runs when a request fails (the device is restarting).
     async function waitFor(accept, timeoutMs, onDown = null) {
+      waitLogin = false;
       const until = Date.now() + timeoutMs;
       while (Date.now() < until) {
         try {
           const r = await fetchJson('/api/status', {}, 3000);
+          if (r.status === 401) {
+            // asking again only brings the browser's login prompt back
+            waitLogin = true;
+            return null;
+          }
           if (r.ok && r.body) {
             const v = accept(r.body);
             if (v) return v;
@@ -704,6 +772,7 @@
         xhr.open('POST', '/api/update');
         xhr.setRequestHeader('X-Web-Rescue', '1');
         xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+        xhr.setRequestHeader('X-No-Login-Prompt', '1');  // see noLoginPrompt
         xhr.timeout = UPLOAD_TIMEOUT_MS;
         xhr.upload.onprogress = e => {
           if (e.lengthComputable && e.total > 0) onProgress(e.loaded / e.total);
@@ -775,6 +844,7 @@
           setStep('rescue', 'failed');
           setMessage(r && r.status === 403
             ? 'The device refused: open this page by its IP address or a local name.'
+            : r && r.status === 401 ? `${LOGIN_NEEDED} Nothing was changed.`
             : r ? `The device answered HTTP ${r.status}. Nothing was changed.`
               : "Couldn't reach the device. Nothing was changed.", 'error');
           return stopRun({ again: true, close: true }, false);
@@ -782,6 +852,12 @@
         setMessage(r.ok ? 'Restarting into rescue mode…' : 'Looking for rescue mode…');
         rescue = await waitFor(st => isRescueStatus(st) ? st : null,
           r.ok ? RESCUE_WAIT_MS : 15000);
+      }
+      if (!rescue && waitLogin) {
+        setStep('rescue', 'failed');
+        setMessage("Rescue mode asks for a login this browser doesn't have. Reload the page and "
+          + "log in: rescue mode's setup page can install the file.", 'error');
+        return stopRun({ close: true }, false);
       }
       if (!rescue) {
         setStep('rescue', 'failed');
@@ -821,7 +897,10 @@
       if (!sent.ok) {
         const stage = $('update-progress').value >= 1 ? 'install' : 'upload';
         setStep(stage, 'failed');
-        setMessage(sent.msg
+        setMessage(sent.status === 401
+          ? "Not installed: the device asks for a login this browser doesn't have. Reload the page "
+            + "and log in; the device is still in rescue mode."
+          : sent.msg
           ? `Not installed: ${sent.msg}. The device is still in rescue mode; the running firmware is unchanged.`
           : sent.timeout
             ? 'The upload took too long and was stopped. The device is still in rescue mode; the running firmware is unchanged.'
@@ -842,6 +921,12 @@
         if (isRescueStatus(st)) return wentDown ? st : null;
         return st.device ? st : null;
       }, BOOT_WAIT_MS, () => { wentDown = true; });
+      if (!back && waitLogin) {
+        setStep('check', '');
+        setMessage(`Installed. The device now asks for a login this browser doesn't have, so this `
+          + `page can't check which build runs. ${LOGIN_NEEDED}`, 'info');
+        return stopRun({ close: true }, false);
+      }
       if (!back) {
         setStep('check', 'failed');
         setMessage('The device has not come back within 3 minutes. Wait a little and reload this '
@@ -926,7 +1011,7 @@
     }
 
     // end of a run that needs the user: buttons, and polling again unless
-    // the device stays in rescue mode (its /api/status keeps it there)
+    // the device stays in rescue mode (until its idle timer ends it)
     function stopRun(buttons, staysInRescue) {
       inRescue = staysInRescue;
       busy = false;
@@ -956,7 +1041,8 @@
         finish({ close: true });
         poller.start();
       } else {
-        setMessage("The device hasn't come back yet. Wait a little and reload this page.", 'error');
+        setMessage(waitLogin ? LOGIN_NEEDED
+          : "The device hasn't come back yet. Wait a little and reload this page.", 'error');
         inRescue = false;
         finish({ close: true });
         poller.start();
@@ -1003,6 +1089,148 @@
       }
     });
 
+    // ---- settings password ----
+    //
+    // Once set, the device asks for it (Basic Auth, user admin) on every page
+    // and request. The browser keeps the login per address, so after a new
+    // password the whole page reloads and the browser asks for it.
+
+    let pwSet = null;       // true/false; null: not known, or firmware without it
+    let pwAsked = false;    // /capabilities answered
+    let pwLoading = false;
+
+    function renderPassword() {
+      $('card-password').hidden = pwSet === null;
+      if (pwSet === null) return;
+      setBadge('badge-password', pwSet ? 'set' : 'not set', pwSet ? 'ok' : 'warn');
+      $('pw-state').textContent = pwSet
+        ? 'A password is set (user admin). Your browser asks for it once per address.'
+        : 'No password: anyone on your network can open and change these pages.';
+      $('pw-save').textContent = pwSet ? 'Change password' : 'Set password';
+      $('pw-remove').hidden = !pwSet;
+    }
+
+    async function loadPassword() {
+      if (pwLoading) return;
+      pwLoading = true;
+      try {
+        const r = await fetchJson('/capabilities?tab=general');
+        if (r.ok) {
+          pwAsked = true;
+          // older firmware sends no password_set: no card
+          pwSet = r.body && typeof r.body.password_set === 'boolean' ? r.body.password_set : null;
+          renderPassword();
+        }
+      } catch (error) {
+        console.error('Password state update failed:', error);
+      } finally {
+        pwLoading = false;
+      }
+    }
+
+    function setPwNote(text, kind = 'info') {
+      $('pw-note').className = kind;
+      setText('pw-note', text);
+    }
+
+    function pwBusy(on) {
+      for (const id of ['pw-new', 'pw-repeat', 'pw-save', 'pw-remove']) $(id).disabled = on;
+    }
+
+    // the same rules as the device: 8-64 printable ASCII characters
+    function passwordProblem(pw, again) {
+      if (!/^[\x20-\x7e]*$/.test(pw)) {
+        return 'Use only letters, digits, spaces and the symbols of an English keyboard '
+          + '(no accents or emoji).';
+      }
+      if (pw.length < 8 || pw.length > 64) return 'The password needs 8 to 64 characters.';
+      if (pw !== again) return "The two passwords don't match.";
+      return null;
+    }
+
+    // POST /api/password: the password goes in the body, never in the URL
+    async function postPassword(pw) {
+      const controller = new AbortController();
+      const abort = setTimeout(() => controller.abort(), 10000);
+      try {
+        const response = await fetch('/api/password', {
+          method: 'POST',
+          cache: 'no-store',
+          signal: controller.signal,
+          headers: noLoginPrompt({ 'X-Status-Action': '1', 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ password: pw }),
+        });
+        let text = '';
+        try {
+          text = (await response.text()).trim().slice(0, 200);
+        } catch (e) {
+          text = '';
+        }
+        return { status: response.status, ok: response.ok, text };
+      } finally {
+        clearTimeout(abort);
+      }
+    }
+
+    // pw: the new password; '' removes it
+    async function changePassword(pw) {
+      const removing = pw === '';
+      setPwNote('');
+      if (busy || inRescue) {
+        setPwNote('Finish the firmware update first.', 'error');
+        return;
+      }
+      pwBusy(true);
+      // once the new password is in, the next poll would bring up the
+      // browser's login prompt: no polling until the page reloads
+      if (!removing) poller.stop();
+      let r = null;
+      try {
+        r = await postPassword(pw);
+      } catch (error) {
+        r = null;
+      }
+      if (!r || !r.ok) {
+        pwBusy(false);
+        if (!removing) poller.start();
+        const what = removing ? 'Not removed' : 'Not saved';
+        setPwNote(!r ? `${what}: couldn't reach the device.`
+          : r.status === 401 ? LOGIN_NEEDED
+          : r.status === 404 ? `${what}: the device can't take a password now (rescue mode or older firmware).`
+          : `${what}: ${r.text || `HTTP ${r.status}`}`, 'error');
+        return;
+      }
+      $('pw-new').value = '';
+      $('pw-repeat').value = '';
+      if (removing) {
+        pwBusy(false);
+        pwSet = false;
+        renderPassword();
+        setPwNote('Removed: these pages open without a login again.', 'success');
+        return;
+      }
+      pwSet = true;
+      renderPassword();
+      setPwNote('Saved. The page reloads now, and your browser asks for the login: '
+        + 'user admin and the new password.', 'success');
+      setTimeout(reloadTop, 3000);
+    }
+
+    $('pw-form').addEventListener('submit', e => {
+      e.preventDefault();
+      const pw = $('pw-new').value;
+      const problem = passwordProblem(pw, $('pw-repeat').value);
+      if (problem) {
+        setPwNote(problem, 'error');
+        return;
+      }
+      changePassword(pw);
+    });
+    $('pw-remove').addEventListener('click', () => {
+      if (confirm('Remove the settings password? Anyone on your network can then open '
+        + 'and change these pages again.')) changePassword('');
+    });
+
     // ---- rendering ----
 
     function render(st) {
@@ -1017,6 +1245,7 @@
       }
       renderWifi(st);
       updateEvents(st);
+      if (!pwAsked) loadPassword();
     }
 
     const poller = new StatusPoller(render, showReachability);

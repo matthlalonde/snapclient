@@ -132,12 +132,14 @@ function setBadge(id, text, kind) {
 // ---- requests ----
 
 // fetch() that gives up after timeoutMs (covers the body too: aborting makes
-// a stalled json() reject)
+// a stalled json() reject). A missing login is a 401 without the browser's
+// prompt (see noLoginPrompt in index.js). url: on the device itself.
 async function fetchJson(url, options = {}, timeoutMs = 5000) {
   const controller = new AbortController();
   const abort = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(url, Object.assign({ cache: 'no-store', signal: controller.signal }, options));
+    const response = await fetch(url, Object.assign({ cache: 'no-store', signal: controller.signal }, options,
+      { headers: noLoginPrompt(options.headers) }));
     let body = null;
     try {
       body = await response.json();
@@ -151,19 +153,39 @@ async function fetchJson(url, options = {}, timeoutMs = 5000) {
 }
 
 // the System tab's and General Settings' buttons (POST /api/action/<name>):
-// true when the device took it. Throws when the device can't be reached.
+// true when the device took it. Throws when the device can't be reached or
+// refused; the error's status is the HTTP status (401: LOGIN_NEEDED).
 async function statusAction(name) {
   const r = await fetchJson(`/api/action/${name}`, {
     method: 'POST',
     headers: { 'X-Status-Action': '1' },
   });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  if (!r.ok) {
+    const error = new Error(r.status === 401 ? LOGIN_NEEDED : `HTTP ${r.status}`);
+    error.status = r.status;
+    throw error;
+  }
   return !!(r.body && r.body.ok === true);
+}
+
+// Reload the whole settings page (the tab bar too, when this page runs in
+// it) and come back to this tab. A reload brings up the browser's login
+// prompt after a 401.
+function reloadTop() {
+  try {
+    if (window.top !== window) {
+      const tab = location.pathname.replace(/^.*\//, '').replace(/\.html$/, '');
+      if (tab) window.top.location.hash = tab;
+    }
+    window.top.location.reload();
+  } catch (e) {
+    location.reload();
+  }
 }
 
 // /api/status can't be read from a page served by another host
 function liveDataBlocked() {
-  return !!BACKEND_URL && new URL(BACKEND_URL, location.href).origin !== location.origin;
+  return !BACKEND_SAME_ORIGIN;
 }
 
 // Another tab of the settings page, through the tab bar when the page runs in
@@ -190,9 +212,12 @@ function isRescueStatus(st) {
 // is hidden ----
 //
 // onStatus(json) renders a normal-mode reply. onState({ stale, wrongHost,
-// rescue }) runs after every request: stale when the last one failed or the
-// device is in rescue mode, wrongHost when the device refused this page's
-// host name (it answers only to its IP or a LAN name).
+// login, rescue }) runs after every request: stale when the last one failed
+// or the device is in rescue mode, wrongHost when the device refused this
+// page's host name (it answers only to its IP or a LAN name), login when it
+// asked for the settings password (401). After a 401 the poller waits for
+// soon() or the tab coming back into view: asking every 2 s would bring the
+// browser's login prompt back each time.
 class StatusPoller {
   constructor(onStatus, onState, interval = POLL_MS) {
     this.onStatus = onStatus;
@@ -237,20 +262,22 @@ class StatusPoller {
     if (this.inFlight) return;
     this.inFlight = true;
     const generation = this.generation;
-    let state = { stale: true, wrongHost: false, rescue: this.inRescue };
+    let state = { stale: true, wrongHost: false, login: false, rescue: this.inRescue };
     let body = null;
     try {
       if (this.inRescue) {
-        // Rescue mode counts every /api/status request as use and stays
-        // until 10 minutes pass without one; this page must not hold it
-        // there. Only normal mode serves the page files; rescue mode 404s
+        // This page must not hold rescue mode open (it ends after 10
+        // minutes without use), so ask for a page file rather than status.
+        // Only normal mode serves the page files; rescue mode 404s
         // them without counting it as use. (Not /favicon.ico: normal mode
         // 404s that too. No query: the file table matches the whole URI.)
+        // A 401 also means normal mode: rescue mode's 404 asks no login.
         const r = await fetchJson('/styles.css');
-        if (r.ok) this.inRescue = false;  // back: ask /api/status next
+        if (r.ok || r.status === 401) this.inRescue = false;  // back: ask /api/status next
       } else {
         const r = await fetchJson('/api/status');
         state.wrongHost = r.status === 403;
+        state.login = r.status === 401;
         if (r.ok && r.body) {
           if (isRescueStatus(r.body)) {
             this.inRescue = true;
@@ -280,6 +307,7 @@ class StatusPoller {
       }
     }
     if (this.onState) this.onState(state);
+    if (state.login) return;  // see the class comment
     // just left rescue mode: the status now, not in 5 s
     if (!this.inRescue && state.rescue) {
       this.soon();
@@ -298,11 +326,22 @@ class StatusPoller {
 const RESCUE_PROBE_MS = 5000;
 
 // The banner and greyed-out cards while the device can't be reached
-function showReachability({ stale, wrongHost, rescue }) {
+function showReachability({ stale, wrongHost, login, rescue }) {
   const offline = document.getElementById('offline');
   if (offline) {
     if (wrongHost) {
       offline.textContent = `The device only answers when this page is opened by its IP address or a local name (name.local, name.lan, …), not ${location.hostname}.`;
+    } else if (login) {
+      const link = document.createElement('a');
+      link.href = '/';
+      link.target = '_top';
+      link.textContent = 'reload the page';
+      link.addEventListener('click', e => {
+        e.preventDefault();
+        reloadTop();
+      });
+      offline.replaceChildren('Login needed: ', link,
+        ', and your browser asks for the settings password (user admin).');
     } else if (rescue) {
       const link = document.createElement('a');
       link.href = '/';

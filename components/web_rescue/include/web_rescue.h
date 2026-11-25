@@ -14,11 +14,19 @@
  *   POST /api/boot?label=X make app partition X the boot slot and reboot
  *   POST /api/reboot
  *   GET  /api/backup.bin   the whole physical flash, for safekeeping
+ *   POST /api/password-clear  remove the settings password; clients on
+ *                          the access point only (require_auth set)
  *   GET  /                 built-in setup page (unless the app serves
  *                          its own, see web_rescue_cfg_t.serve_root)
  *
- * The running app is marked valid (rollback cancelled) on the first HTTP
- * request: reaching the page proves the new firmware works.
+ * The running app is marked valid (rollback cancelled) on the first request
+ * that counts as use: reaching the page proves the new firmware works. Every
+ * request counts except /api/status without an X-Web-Rescue: 1 header, so a
+ * poller such as Home Assistant doesn't keep rescue mode open.
+ *
+ * With require_auth, every request needs the settings password (Basic
+ * Auth, see web_auth.h) if one is set, except from clients on the access
+ * point. /api/status then also reports "password_set" and "on_ap".
  */
 #pragma once
 
@@ -34,6 +42,7 @@ typedef struct {
   const char *ap_password;      // >= 8 chars for WPA2, NULL or "" = open
   bool nvs_ok;                  // NVS initialised (else WiFi runs RAM-only)
   bool serve_root;              // serve the built-in page at "/"
+  bool require_auth;            // ask for the settings password (snapclient)
 } web_rescue_cfg_t;
 
 // Bring up netif + default event loop (if needed), WiFi AP+STA (STA uses
@@ -43,15 +52,17 @@ esp_err_t web_rescue_start(const web_rescue_cfg_t *cfg);
 // The running HTTP server, to register more URI handlers.
 httpd_handle_t web_rescue_httpd(void);
 
-// esp_timer time (us) of the last HTTP request, 0 if none yet.
+// esp_timer time (us) of the last request that counted as use (see above),
+// 0 if none yet.
 int64_t web_rescue_last_request_us(void);
 
 // Call from app-registered URI handlers: records activity and, on the first
 // request, marks the running firmware valid.
 void web_rescue_touch(void);
 
-// Request gate for every handler (built-in ones use it too). Rejects with
-// 403 and returns false when
+// Request gate for every handler (built-in ones use it too). With
+// require_auth it answers 401/429 for a missing or wrong login (after the
+// Host check). Rejects with 403 and returns false when
 //   - the Host header is not an IP literal, a single-label name or a name
 //     under .local, .lan, .home, .home.arpa, .internal or .localdomain
 //     (blocks DNS rebinding: a hostile web page cannot make the browser talk

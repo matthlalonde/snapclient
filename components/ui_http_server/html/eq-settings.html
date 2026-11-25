@@ -413,16 +413,16 @@
         const backendUrl = getBackendUrl();
         
         // Fetch schema
-        const schemaResponse = await fetch(`${backendUrl}/api/eq/schema`);
+        const schemaResponse = await fetch(`${backendUrl}/api/eq/schema`, { headers: backendHeaders() });
         if (!schemaResponse.ok) {
-          throw new Error('Failed to fetch EQ schema');
+          throw new Error(schemaResponse.status === 401 ? LOGIN_NEEDED : 'Failed to fetch EQ schema');
         }
         schema = await schemaResponse.json();
         
         // Fetch current settings
-        const settingsResponse = await fetch(`${backendUrl}/api/eq/settings`);
+        const settingsResponse = await fetch(`${backendUrl}/api/eq/settings`, { headers: backendHeaders() });
         if (!settingsResponse.ok) {
-          throw new Error('Failed to fetch EQ settings');
+          throw new Error(settingsResponse.status === 401 ? LOGIN_NEEDED : 'Failed to fetch EQ settings');
         }
         currentSettings = await settingsResponse.json();
         
@@ -570,8 +570,8 @@
             console.log('Mode changed, reloading schema and settings...');
             const backendUrl = getBackendUrl();
             const [schemaResponse, settingsResponse] = await Promise.all([
-              fetch(`${backendUrl}/api/eq/schema`),
-              fetch(`${backendUrl}/api/eq/settings`)
+              fetch(`${backendUrl}/api/eq/schema`, { headers: backendHeaders() }),
+              fetch(`${backendUrl}/api/eq/settings`, { headers: backendHeaders() })
             ]);
             if (schemaResponse.ok && settingsResponse.ok) {
               schema = await schemaResponse.json();
@@ -586,8 +586,8 @@
             console.log('Reloading schema and settings to fetch actual DAC coefficients...');
             const backendUrl = getBackendUrl();
             const [schemaResponse, settingsResponse] = await Promise.all([
-              fetch(`${backendUrl}/api/eq/schema`),
-              fetch(`${backendUrl}/api/eq/settings`)
+              fetch(`${backendUrl}/api/eq/schema`, { headers: backendHeaders() }),
+              fetch(`${backendUrl}/api/eq/settings`, { headers: backendHeaders() })
             ]);
             if (schemaResponse.ok && settingsResponse.ok) {
               schema = await schemaResponse.json();

@@ -19,12 +19,41 @@ function getBackendURL() {
 
 const BACKEND_URL = getBackendURL();
 
+// true unless ?backend= points at another origin
+const BACKEND_SAME_ORIGIN = (() => {
+  if (!BACKEND_URL) return true;
+  try {
+    return new URL(BACKEND_URL, location.href).origin === location.origin;
+  } catch (e) {
+    return false;
+  }
+})();
+
+// a 401: the device has a settings password and this browser's login is
+// missing or out of date
+const LOGIN_NEEDED = 'Login needed: reload the page.';
+
+// Headers for a script request to the device. With X-No-Login-Prompt it
+// answers a missing login with a plain 401, so the browser shows no login
+// prompt that a request timeout would then cancel. The pages say
+// LOGIN_NEEDED instead, and the reload brings up the prompt.
+function noLoginPrompt(headers = {}) {
+  return Object.assign({ 'X-No-Login-Prompt': '1' }, headers);
+}
+
+// The same for a request to BACKEND_URL. Another origin (?backend=) gets no
+// extra header: it would need a CORS preflight the device doesn't allow.
+function backendHeaders(headers = {}) {
+  return BACKEND_SAME_ORIGIN ? noLoginPrompt(headers) : Object.assign({}, headers);
+}
+
 // The device's reason when the last save or reset was refused (for example,
 // the page was opened by a name it doesn't accept), for error messages
 let lastSaveError = '';
 
 // An Error with the device's answer text, or the status when there is none
 async function responseError(response) {
+  if (response.status === 401) return new Error(LOGIN_NEEDED);
   let text = '';
   try {
     text = (await response.text()).trim();
@@ -41,7 +70,7 @@ async function responseError(response) {
  */
 async function getRequest(endpoint) {
   try {
-    const response = await fetch(BACKEND_URL + endpoint);
+    const response = await fetch(BACKEND_URL + endpoint, { headers: backendHeaders() });
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`);
     }
@@ -65,7 +94,7 @@ async function postRequest(endpoint, data = null) {
     // save either)
     const options = {
       method: 'POST',
-      headers: { 'X-Status-Action': '1' }
+      headers: backendHeaders({ 'X-Status-Action': '1' })
     };
 
     if (data) {
@@ -137,7 +166,7 @@ async function deleteParameter(paramKey) {
   try {
     const response = await fetch(`/delete?param=${paramKey}`, {
       method: 'DELETE',
-      headers: { 'X-Status-Action': '1' },  // see postRequest
+      headers: noLoginPrompt({ 'X-Status-Action': '1' }),  // see postRequest
     });
     if (!response.ok) {
       throw await responseError(response);

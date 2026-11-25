@@ -9,7 +9,11 @@
  * setup page at http://192.168.4.1 (WiFi credentials, firmware upload,
  * firmware slot switch). It also joins the stored WiFi, so the page is
  * reachable on the home network too. After CONFIG_RESCUE_IDLE_REBOOT_S
- * without web requests it reboots into normal operation.
+ * without requests that count as use (status polls without X-Web-Rescue
+ * don't) it reboots into normal operation.
+ *
+ * Pages need the settings password if one is set, except over the access
+ * point. Holding the button 10 s in rescue mode removes the password.
  */
 #include "esp_system.h"
 #include "sdkconfig.h"
@@ -28,6 +32,7 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "web_auth.h"
 
 // web_rescue falls back to an OPEN access point for passwords under 8
 // characters (WPA2 minimum). Never build that: the AP serves firmware
@@ -44,6 +49,7 @@ static const char *TAG = "rescue";
 #define BUTTON_SAMPLE_MS 50
 #define SHORT_PRESS_MIN_MS 100   // two samples: not a glitch
 #define SHORT_PRESS_MAX_MS 2000  // a longer press is on its way to rescue
+#define HOLD_TO_CLEAR_PW_MS 10000  // rescue mode: removes the settings password
 
 #define CRASH_MAGIC 0x43524153u  // "CRAS"
 #define CRASHES_TO_RESCUE 3         // consecutive abnormal resets
@@ -159,14 +165,35 @@ bool rescue_mode_requested(void) {
   return false;
 }
 
+// Recovery gesture: the way back in after a forgotten settings password
+static void clear_password_by_button(void) {
+  if (!web_auth_password_set()) {
+    ESP_LOGI(TAG, "button held 10 s: no settings password to remove");
+    web_rescue_note(false, false,
+                    "Button held 10 s; no settings password was set");
+  } else if (web_auth_set_password(NULL) == ESP_OK) {
+    ESP_LOGW(TAG, "button held 10 s: settings password removed");
+    web_rescue_note(false, false, "Settings password removed with the button");
+  } else {
+    web_rescue_note(false, true, "Could not remove the settings password");
+  }
+}
+
 void rescue_mode_run(bool nvs_ok) {
   web_rescue_unlock_physical_flash();
+  // the crash-loop and request paths skip rescue_mode_requested()'s init
+  button_init();
+  // a hold from power-up counts from here
+  int64_t pressed_since = button_pressed() ? esp_timer_get_time() : -1;
+  bool cleared = false;
   const web_rescue_cfg_t cfg = {
       .title = "snapclient rescue / setup",
       .ap_ssid_prefix = "snapclient",
       .ap_password = CONFIG_RESCUE_AP_PASSWORD,
       .nvs_ok = nvs_ok,
       .serve_root = true,
+      // without NVS no password can be read: stay open
+      .require_auth = nvs_ok,
   };
   if (web_rescue_start(&cfg) != ESP_OK) {
     ESP_LOGE(TAG, "could not start the access point, rebooting in 30 s");
@@ -178,13 +205,23 @@ void rescue_mode_run(bool nvs_ok) {
   web_rescue_note(false, false, "Rescue mode: setup access point open");
   const int64_t start = esp_timer_get_time();
   while (1) {
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(BUTTON_SAMPLE_MS));
+    const int64_t now = esp_timer_get_time();
+    if (!button_pressed()) {
+      pressed_since = -1;
+      cleared = false;
+    } else if (pressed_since < 0) {
+      pressed_since = now;
+    } else if (!cleared &&
+               now - pressed_since >= HOLD_TO_CLEAR_PW_MS * 1000LL) {
+      cleared = true;  // once per hold
+      clear_password_by_button();
+    }
 #if CONFIG_RESCUE_IDLE_REBOOT_S > 0
     if (web_rescue_update_in_progress()) continue;
     int64_t last = web_rescue_last_request_us();
     if (last < start) last = start;
-    if (esp_timer_get_time() - last >
-        (int64_t)CONFIG_RESCUE_IDLE_REBOOT_S * 1000000LL) {
+    if (now - last > (int64_t)CONFIG_RESCUE_IDLE_REBOOT_S * 1000000LL) {
       ESP_LOGI(TAG, "idle, rebooting into normal mode");
       web_rescue_note(true, false, "Rescue mode idle; restarting normally");
       esp_restart();

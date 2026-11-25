@@ -22,6 +22,8 @@
 #include "esp_timer.h"
 #include "event_log.h"
 #include "web_rescue.h"  // the Host check (always built)
+#include "web_auth.h"    // the settings password (Basic Auth)
+#include "mbedtls/platform_util.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
@@ -142,7 +144,7 @@ static esp_err_t send_400(httpd_req_t *req, const char *msg) {
  * on another site that points its own name at this board, DNS rebinding, is
  * refused), plus the X-Status-Action header. Another site's page can't send
  * that header, because the CORS answer (set_cors_headers) doesn't allow it.
- * Answers 403 itself on refusal. Reads stay open. */
+ * Answers 403 itself on refusal. Reads need only the login (see gated). */
 static bool action_allowed(httpd_req_t *req) {
 	if (!web_rescue_host_allowed(req)) return false;
 	char hdr[4];
@@ -709,7 +711,8 @@ static esp_err_t get_capabilities_handler(httpd_req_t *req) {
 			return ESP_OK;
 		}
 
-		esp_err_t ret = settings_get_json(general_json, general_size);
+		// leaves 32 bytes for "password_set", added below
+		esp_err_t ret = settings_get_json(general_json, general_size - 32);
 
 		if (ret != ESP_OK) {
 			ESP_LOGE(TAG, "%s: Failed to get general settings JSON: %s",
@@ -720,6 +723,17 @@ static esp_err_t get_capabilities_handler(httpd_req_t *req) {
 				req, "{\"error\": \"Failed to retrieve general settings\"}");
 			return ESP_OK;
 		}
+
+#if CONFIG_RESCUE_MODE_ENABLE
+		// the flag goes in place of the closing brace, which it puts back.
+		// Without it (no rescue mode), the System tab shows no password card.
+		char *end = strrchr(general_json, '}');
+		if (end != NULL && end > general_json) {
+			snprintf(end, general_size - (size_t)(end - general_json),
+					 "%s\"password_set\":%s}", end[-1] == '{' ? "" : ",",
+					 web_auth_password_set() ? "true" : "false");
+		}
+#endif
 
 		httpd_resp_set_status(req, "200 OK");
 		httpd_resp_set_type(req, "application/json");
@@ -1045,7 +1059,99 @@ static esp_err_t restart_post_handler(httpd_req_t *req) {
 	return ESP_OK;
 }
 
+/* The settings password only comes with rescue mode: it is the way back from
+ * a forgotten one (the button, or the rescue access point). */
 #if CONFIG_RESCUE_MODE_ENABLE
+/* True if the body has a '[' or a second '{' outside strings. Only a flat
+ * {"password":"..."} is accepted: cJSON parses nesting by recursion, and a
+ * body of [[[[... could run it past the small httpd stack. */
+static bool json_nested(const char *s, size_t len) {
+	bool in_string = false;
+	int objects = 0;
+	for (size_t i = 0; i < len; i++) {
+		const char c = s[i];
+		if (in_string) {
+			if (c == '\\')
+				i++;  // skip the escaped character
+			else if (c == '"')
+				in_string = false;
+		} else if (c == '"') {
+			in_string = true;
+		} else if (c == '[' || (c == '{' && ++objects > 1)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Zero the parsed body's top-level strings (the password among them), then
+ * free it */
+static void json_wipe_delete(cJSON *root) {
+	if (root != NULL && root->valuestring != NULL)
+		mbedtls_platform_zeroize(root->valuestring, strlen(root->valuestring));
+	for (cJSON *c = root != NULL ? root->child : NULL; c != NULL; c = c->next) {
+		if (c->valuestring != NULL)
+			mbedtls_platform_zeroize(c->valuestring, strlen(c->valuestring));
+	}
+	cJSON_Delete(root);
+}
+
+/*
+ * POST /api/password, body {"password":"..."}: sets the settings password,
+ * "" removes it. The value is never logged, sent back or put in the URL: the
+ * UDP logger broadcasts the logs on the LAN. No CORS headers: the board's own
+ * pages only.
+ */
+static esp_err_t password_post_handler(httpd_req_t *req) {
+	ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
+	if (!action_allowed(req)) return ESP_OK;
+	if (req->content_len == 0) return send_400(req, "missing body");
+	if (req->content_len > 256) return send_400(req, "too long");
+
+	char body[257];
+	size_t got = 0;
+	while (got < req->content_len) {
+		int r = httpd_req_recv(req, body + got, req->content_len - got);
+		if (r <= 0) {
+			mbedtls_platform_zeroize(body, sizeof(body));
+			if (r == HTTPD_SOCK_ERR_TIMEOUT) httpd_resp_send_408(req);
+			return ESP_FAIL;  // closes the connection
+		}
+		got += (size_t)r;
+	}
+	body[got] = '\0';
+	if (json_nested(body, got)) {
+		mbedtls_platform_zeroize(body, sizeof(body));
+		return send_400(req, "bad JSON");
+	}
+	cJSON *root = cJSON_ParseWithLength(body, got);
+	mbedtls_platform_zeroize(body, sizeof(body));
+	if (root == NULL) return send_400(req, "bad JSON");
+
+	const cJSON *pw = cJSON_GetObjectItemCaseSensitive(root, "password");
+	bool found = cJSON_IsString(pw) && pw->valuestring != NULL;
+	bool removing = found && pw->valuestring[0] == '\0';
+	esp_err_t err = found ? web_auth_set_password(pw->valuestring) : ESP_OK;
+	json_wipe_delete(root);
+
+	if (!found) return send_400(req, "missing password");
+	if (err == ESP_ERR_INVALID_ARG)
+		return send_400(req, "password: 8-64 printable characters");
+	if (err != ESP_OK) {
+		ESP_LOGE(TAG, "%s: could not save the password: %s", __func__,
+				 esp_err_to_name(err));
+		httpd_resp_set_status(req, "500 Internal Server Error");
+		return httpd_resp_sendstr(req, "could not save the password");
+	}
+	ESP_LOGI(TAG, "%s: settings password %s", __func__,
+			 removing ? "removed" : "set");
+	event_log_add(EVENT_SRC_SYSTEM, EVENT_INFO,
+				  removing ? "Settings password removed"
+						   : "Settings password set");
+	httpd_resp_set_status(req, "200 OK");
+	return httpd_resp_sendstr(req, "ok");
+}
+
 /* POST /api/rescue: reboot into rescue mode, whose setup page installs
  * firmware with image checks (the upstream port-8032 updater does none).
  * Guarded like the rescue page: needs the X-Web-Rescue header and a LAN Host
@@ -1414,6 +1520,56 @@ static esp_err_t options_handler(httpd_req_t *req) {
 	return ESP_OK;
 }
 
+/* Every route except the CORS preflights runs through here: the login check
+ * first (it answers 401 or 429 itself), then the real handler, kept in
+ * user_ctx. It runs before any handler sets a header, so the 401 has room
+ * for its own (httpd allows 8, pages use 7). A refused large body is not
+ * read and thrown away: the connection is closed instead. */
+static esp_err_t gated(httpd_req_t *req) {
+#if CONFIG_RESCUE_MODE_ENABLE
+	// with a password set, check the host first: a page on another site that
+	// points its own name here (DNS rebinding) gets a 403, not a login prompt
+	// under its own name that would collect the password
+	if (web_auth_password_set() && !web_rescue_host_allowed(req))
+		return (req->content_len > 4096) ? ESP_FAIL : ESP_OK;
+	if (!web_auth_check(req))
+		return (req->content_len > 4096) ? ESP_FAIL : ESP_OK;
+#endif
+	// without rescue mode there is no login: a password stored by another
+	// build is ignored, as nothing here could remove it
+	return ((esp_err_t (*)(httpd_req_t *))req->user_ctx)(req);
+}
+
+/* Register a route behind gated. Use it for every route but OPTIONS, so none
+ * can skip the login. */
+static esp_err_t add_route(const char *uri, httpd_method_t method,
+						   esp_err_t (*fn)(httpd_req_t *)) {
+	httpd_uri_t h = {
+		.uri = uri,
+		.method = method,
+		.handler = gated,
+		.user_ctx = (void *)fn,
+	};
+	esp_err_t ret = httpd_register_uri_handler(server, &h);
+	if (ret != ESP_OK) {
+		ESP_LOGE(TAG, "%s: could not register %s: %s", __func__, uri,
+				 esp_err_to_name(ret));
+	}
+	return ret;
+}
+
+/* A CORS preflight: no login (browsers never send one there) and no data */
+static void add_preflight(const char *uri) {
+	httpd_uri_t h = {
+		.uri = uri,
+		.method = HTTP_OPTIONS,
+		.handler = options_handler,
+	};
+	if (httpd_register_uri_handler(server, &h) != ESP_OK) {
+		ESP_LOGE(TAG, "%s: could not register %s", __func__, uri);
+	}
+}
+
 /**
  */
 esp_err_t stop_server(void) {
@@ -1438,6 +1594,9 @@ esp_err_t start_server(const char *base_path, int port) {
 	// CONFIG_LWIP_MAX_SOCKETS in the board settings); LRU purge needs it
 	config.max_open_sockets = 4;
 	config.max_uri_handlers = 64;
+	// room for the Authorization header next to a browser's usual ones; the
+	// buffer only grows to what a request uses
+	config.max_req_hdr_len = 2048;
 	// handlers print JSON with cJSON (full printf) and copy status snapshots;
 	// internal RAM, as the settings handlers write NVS
 	config.stack_size = 6144;
@@ -1446,6 +1605,11 @@ esp_err_t start_server(const char *base_path, int port) {
 	/* Enable wildcard URI matching for static file handler */
 	config.uri_match_fn = httpd_uri_match_wildcard;
 
+#if CONFIG_RESCUE_MODE_ENABLE
+	// load the settings password before the first request
+	web_auth_init();
+#endif
+
 	ESP_LOGI(TAG, "%s: Starting HTTP Server on port: '%d'", __func__,
 			 config.server_port);
 	if (httpd_start(&server, &config) != ESP_OK) {
@@ -1453,221 +1617,44 @@ esp_err_t start_server(const char *base_path, int port) {
 		return ESP_FAIL;
 	}
 
-	/* URI handler for get */
-	httpd_uri_t _root_get_handler = {
-		.uri = "/",
-		.method = HTTP_GET,
-		.handler = root_get_handler,
-		//.user_ctx  = server_data	// Pass server data as context
-	};
-	httpd_register_uri_handler(server, &_root_get_handler);
-
-	/* URI handler for post */
-	httpd_uri_t _root_post_handler = {
-		.uri = "/post",
-		.method = HTTP_POST,
-		.handler = root_post_handler,
-		//.user_ctx  = server_data	// Pass server data as context
-	};
-	httpd_register_uri_handler(server, &_root_post_handler);
-
-	/* URI handler for delete */
-	httpd_uri_t _root_delete_handler = {
-		.uri = "/delete",
-		.method = HTTP_DELETE,
-		.handler = root_delete_handler,
-	};
-	httpd_register_uri_handler(server, &_root_delete_handler);
-
-	/* URI handler for get parameter */
-	httpd_uri_t _get_param_handler = {
-		.uri = "/get",
-		.method = HTTP_GET,
-		.handler = get_param_handler,
-	};
-	httpd_register_uri_handler(server, &_get_param_handler);
-
-	/* URI handler for capabilities */
-	httpd_uri_t _get_capabilities_handler = {
-		.uri = "/capabilities",
-		.method = HTTP_GET,
-		.handler = get_capabilities_handler,
-	};
-	httpd_register_uri_handler(server, &_get_capabilities_handler);
-
-	/* URI handler for the live tabs' data */
-	httpd_uri_t _status_get_handler = {
-		.uri = "/api/status",
-		.method = HTTP_GET,
-		.handler = status_get_handler,
-	};
-	httpd_register_uri_handler(server, &_status_get_handler);
-
-	/* URI handler for the live tabs' buttons */
-	httpd_uri_t _action_post_handler = {
-		.uri = "/api/action/*",
-		.method = HTTP_POST,
-		.handler = action_post_handler,
-	};
-	httpd_register_uri_handler(server, &_action_post_handler);
-
-	/* URI handler for the System tab's event log */
-	httpd_uri_t _events_get_handler = {
-		.uri = "/api/events",
-		.method = HTTP_GET,
-		.handler = events_get_handler,
-	};
-	httpd_register_uri_handler(server, &_events_get_handler);
-
-	/* URI handler for favicon.ico */
-	httpd_uri_t _favicon_get_handler = {
-		.uri = "/favicon.ico",
-		.method = HTTP_GET,
-		.handler = favicon_get_handler,
-		//.user_ctx  = server_data	// Pass server data as context
-	};
-	httpd_register_uri_handler(server, &_favicon_get_handler);
-
-	/* URI handler for restart (POST) */
-	httpd_uri_t _restart_post_handler = {
-		.uri = "/restart",
-		.method = HTTP_POST,
-		.handler = restart_post_handler,
-	};
-	httpd_register_uri_handler(server, &_restart_post_handler);
-
+	add_route("/", HTTP_GET, root_get_handler);
+	add_route("/post", HTTP_POST, root_post_handler);
+	add_route("/delete", HTTP_DELETE, root_delete_handler);
+	add_route("/get", HTTP_GET, get_param_handler);
+	add_route("/capabilities", HTTP_GET, get_capabilities_handler);
+	add_route("/api/status", HTTP_GET, status_get_handler);      // live tabs' data
+	add_route("/api/action/*", HTTP_POST, action_post_handler);  // their buttons
+	add_route("/api/events", HTTP_GET, events_get_handler);      // event log
+	add_route("/favicon.ico", HTTP_GET, favicon_get_handler);
+	add_route("/restart", HTTP_POST, restart_post_handler);
 #if CONFIG_RESCUE_MODE_ENABLE
-	httpd_uri_t _rescue_post_handler = {
-		.uri = "/api/rescue",
-		.method = HTTP_POST,
-		.handler = rescue_post_handler,
-		.user_ctx = NULL};
-	httpd_register_uri_handler(server, &_rescue_post_handler);
+	add_route("/api/password", HTTP_POST, password_post_handler);
+	add_route("/api/rescue", HTTP_POST, rescue_post_handler);
 #endif
 
-	/* URI handler for OPTIONS (CORS preflight) - specific endpoints */
-	httpd_uri_t _options_post_handler = {
-		.uri = "/post",
-		.method = HTTP_OPTIONS,
-		.handler = options_handler,
-	};
-	httpd_register_uri_handler(server, &_options_post_handler);
-
-	httpd_uri_t _options_get_handler = {
-		.uri = "/get",
-		.method = HTTP_OPTIONS,
-		.handler = options_handler,
-	};
-	httpd_register_uri_handler(server, &_options_get_handler);
-
-	httpd_uri_t _options_delete_handler = {
-		.uri = "/delete",
-		.method = HTTP_OPTIONS,
-		.handler = options_handler,
-	};
-	httpd_register_uri_handler(server, &_options_delete_handler);
-
-	httpd_uri_t _options_capabilities_handler = {
-		.uri = "/capabilities",
-		.method = HTTP_OPTIONS,
-		.handler = options_handler,
-	};
-	httpd_register_uri_handler(server, &_options_capabilities_handler);
-
-	httpd_uri_t _options_restart_handler = {
-		.uri = "/restart",
-		.method = HTTP_OPTIONS,
-		.handler = options_handler,
-	};
-	httpd_register_uri_handler(server, &_options_restart_handler);
+	add_preflight("/post");
+	add_preflight("/get");
+	add_preflight("/delete");
+	add_preflight("/capabilities");
+	add_preflight("/restart");
 
 #if CONFIG_DAC_TAS5805M
-	/* URI handlers for DAC settings API */
-	httpd_uri_t _get_dac_settings_handler = {
-		.uri = "/api/dac/settings",
-		.method = HTTP_GET,
-		.handler = get_dac_settings_handler,
-	};
-	httpd_register_uri_handler(server, &_get_dac_settings_handler);
+	/* DAC and EQ settings API */
+	add_route("/api/dac/settings", HTTP_GET, get_dac_settings_handler);
+	add_route("/api/dac/schema", HTTP_GET, get_dac_schema_handler);
+	add_route("/api/dac/settings", HTTP_POST, post_dac_settings_handler);
+	add_preflight("/api/dac/settings");
+	add_preflight("/api/dac/schema");
 
-	httpd_uri_t _get_dac_schema_handler = {
-		.uri = "/api/dac/schema",
-		.method = HTTP_GET,
-		.handler = get_dac_schema_handler,
-	};
-	httpd_register_uri_handler(server, &_get_dac_schema_handler);
-
-	httpd_uri_t _post_dac_settings_handler = {
-		.uri = "/api/dac/settings",
-		.method = HTTP_POST,
-		.handler = post_dac_settings_handler,
-	};
-	httpd_register_uri_handler(server, &_post_dac_settings_handler);
-
-	/* OPTIONS handlers for CORS preflight - DAC endpoints */
-	httpd_uri_t _options_dac_settings_handler = {
-		.uri = "/api/dac/settings",
-		.method = HTTP_OPTIONS,
-		.handler = options_handler,
-	};
-	httpd_register_uri_handler(server, &_options_dac_settings_handler);
-
-	httpd_uri_t _options_dac_schema_handler = {
-		.uri = "/api/dac/schema",
-		.method = HTTP_OPTIONS,
-		.handler = options_handler,
-	};
-	httpd_register_uri_handler(server, &_options_dac_schema_handler);
-
-	/* URI handlers for EQ settings API */
-	httpd_uri_t _get_eq_settings_handler = {
-		.uri = "/api/eq/settings",
-		.method = HTTP_GET,
-		.handler = get_eq_settings_handler,
-	};
-	httpd_register_uri_handler(server, &_get_eq_settings_handler);
-
-	httpd_uri_t _get_eq_schema_handler = {
-		.uri = "/api/eq/schema",
-		.method = HTTP_GET,
-		.handler = get_eq_schema_handler,
-	};
-	httpd_register_uri_handler(server, &_get_eq_schema_handler);
-
-	httpd_uri_t _post_eq_settings_handler = {
-		.uri = "/api/eq/settings",
-		.method = HTTP_POST,
-		.handler = post_eq_settings_handler,
-	};
-	httpd_register_uri_handler(server, &_post_eq_settings_handler);
-
-	/* OPTIONS handlers for CORS preflight - EQ endpoints */
-	httpd_uri_t _options_eq_settings_handler = {
-		.uri = "/api/eq/settings",
-		.method = HTTP_OPTIONS,
-		.handler = options_handler,
-	};
-	httpd_register_uri_handler(server, &_options_eq_settings_handler);
-
-	httpd_uri_t _options_eq_schema_handler = {
-		.uri = "/api/eq/schema",
-		.method = HTTP_OPTIONS,
-		.handler = options_handler,
-	};
-	httpd_register_uri_handler(server, &_options_eq_schema_handler);
+	add_route("/api/eq/settings", HTTP_GET, get_eq_settings_handler);
+	add_route("/api/eq/schema", HTTP_GET, get_eq_schema_handler);
+	add_route("/api/eq/settings", HTTP_POST, post_eq_settings_handler);
+	add_preflight("/api/eq/settings");
+	add_preflight("/api/eq/schema");
 #endif /* CONFIG_DAC_TAS5805M */
 
-	/* URI handler for static files (catch-all, must be last) */
-	httpd_uri_t _static_file_handler = {
-		.uri = "/*",
-		.method = HTTP_GET,
-		.handler = static_file_handler,
-	};
-	esp_err_t ret = httpd_register_uri_handler(server, &_static_file_handler);
-	if (ret != ESP_OK) {
-		ESP_LOGE(TAG, "%s: Failed to register static file handler: %s",
-				 __func__, esp_err_to_name(ret));
-	} else {
+	/* static files (catch-all, must be last) */
+	if (add_route("/*", HTTP_GET, static_file_handler) == ESP_OK) {
 		ESP_LOGI(TAG, "%s: Static file handler registered for /*", __func__);
 	}
 

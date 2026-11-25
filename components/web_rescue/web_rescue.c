@@ -32,6 +32,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "soc/soc.h"
+#include "web_auth.h"
 
 static const char *TAG = "web_rescue";
 
@@ -44,6 +45,8 @@ static const char *TAG = "web_rescue";
 
 #define STA_RETRY_US (10 * 1000 * 1000)  // keep the AP usable between scans
 #define CHUNK 4096
+// A refused request with a bigger body closes the connection instead
+#define BIG_BODY 4096
 
 static web_rescue_cfg_t s_cfg;
 static httpd_handle_t s_httpd = NULL;
@@ -125,20 +128,32 @@ bool web_rescue_host_allowed(httpd_req_t *req) {
   return true;
 }
 
-bool web_rescue_allow(httpd_req_t *req, bool sensitive) {
+static bool has_rescue_header(httpd_req_t *req) {
+  char v[4] = "";
+  return httpd_req_get_hdr_value_str(req, WEB_RESCUE_HEADER, v, sizeof(v)) ==
+             ESP_OK &&
+         strcmp(v, "1") == 0;
+}
+
+// web_rescue_allow() without web_rescue_touch()
+static bool gate(httpd_req_t *req, bool sensitive) {
   if (!web_rescue_host_allowed(req)) {
     return false;
   }
-  if (sensitive) {
-    char v[4] = "";
-    if (httpd_req_get_hdr_value_str(req, WEB_RESCUE_HEADER, v, sizeof(v)) !=
-            ESP_OK ||
-        strcmp(v, "1") != 0) {
-      httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
-                          "missing " WEB_RESCUE_HEADER " header");
-      return false;
-    }
+  // before web_rescue_touch: failed logins don't keep rescue mode open
+  if (s_cfg.require_auth && !web_auth_check(req)) {
+    return false;
   }
+  if (sensitive && !has_rescue_header(req)) {
+    httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
+                        "missing " WEB_RESCUE_HEADER " header");
+    return false;
+  }
+  return true;
+}
+
+bool web_rescue_allow(httpd_req_t *req, bool sensitive) {
+  if (!gate(req, sensitive)) return false;
   web_rescue_touch();
   return true;
 }
@@ -180,6 +195,13 @@ static esp_err_t send_json(httpd_req_t *req, cJSON *root) {
   esp_err_t err = httpd_resp_sendstr(req, txt);
   free(txt);
   return err;
+}
+
+// Return value for a handler whose web_rescue_allow() failed. With a big
+// body, ESP_FAIL makes httpd close the connection; ESP_OK would read and
+// drop the whole body (a 1.8 MB upload, 32 bytes at a time).
+static esp_err_t refused(httpd_req_t *req) {
+  return req->content_len > BIG_BODY ? ESP_FAIL : ESP_OK;
 }
 
 static esp_err_t send_result(httpd_req_t *req, bool ok, const char *msg) {
@@ -326,8 +348,12 @@ static void add_app_desc(cJSON *o, const esp_app_desc_t *d) {
   cJSON_AddStringToObject(a, "built", built);
 }
 
+// Counts as use only with the X-Web-Rescue header, which the rescue page
+// sends: a logged-in poller (Home Assistant every 30 s, a left-open settings
+// tab) must not keep rescue mode open.
 static esp_err_t status_get(httpd_req_t *req) {
-  if (!web_rescue_allow(req, false)) return ESP_OK;
+  if (!gate(req, false)) return ESP_OK;
+  if (has_rescue_header(req)) web_rescue_touch();
   cJSON *r = cJSON_CreateObject();
   cJSON_AddStringToObject(r, "title", s_cfg.title ? s_cfg.title : "");
   add_app_desc(r, esp_app_get_description());
@@ -411,11 +437,14 @@ static esp_err_t status_get(httpd_req_t *req) {
   cJSON_AddBoolToObject(w, "saved_to_nvs", s_cfg.nvs_ok);
   cJSON_AddNumberToObject(r, "uptime_s", esp_timer_get_time() / 1000000);
   cJSON_AddNumberToObject(r, "free_heap", esp_get_free_heap_size());
+  cJSON_AddBoolToObject(r, "password_set",
+                        s_cfg.require_auth && web_auth_password_set());
+  cJSON_AddBoolToObject(r, "on_ap", web_auth_request_on_ap(req));
   return send_json(req, r);
 }
 
 static esp_err_t wifi_post(httpd_req_t *req) {
-  if (!web_rescue_allow(req, true)) return ESP_OK;
+  if (!web_rescue_allow(req, true)) return refused(req);
   char body[512];
   int len = req->content_len < sizeof(body) - 1 ? req->content_len
                                                  : sizeof(body) - 1;
@@ -495,7 +524,7 @@ static const char *check_app_image(const uint8_t *b, size_t have) {
 }
 
 static esp_err_t update_post(httpd_req_t *req) {
-  if (!web_rescue_allow(req, true)) return ESP_OK;
+  if (!web_rescue_allow(req, true)) return refused(req);
   const esp_partition_t *target = esp_ota_get_next_update_partition(NULL);
   const esp_partition_t *running = esp_ota_get_running_partition();
   const size_t total = req->content_len;
@@ -647,6 +676,23 @@ static esp_err_t backup_get(httpd_req_t *req) {
   return httpd_resp_send_chunk(req, NULL, 0);
 }
 
+// Removes the settings password. Access point clients only: being on it
+// takes the AP password (rescue mode can be forced from the LAN, so the
+// home WiFi side gets no such shortcut).
+static esp_err_t password_clear_post(httpd_req_t *req) {
+  if (!web_rescue_allow(req, true)) return refused(req);
+  if (!web_auth_request_on_ap(req)) {
+    httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
+                        "only over the rescue access point");
+    return ESP_OK;
+  }
+  esp_err_t err = web_auth_set_password(NULL);
+  if (err != ESP_OK) return send_result(req, false, esp_err_to_name(err));
+  web_rescue_note(false, false,
+                  "Settings password removed from the rescue access point");
+  return send_result(req, true, "settings password removed");
+}
+
 static esp_err_t page_get(httpd_req_t *req) {
   if (!web_rescue_allow(req, false)) return ESP_OK;
   httpd_resp_set_type(req, "text/html; charset=utf-8");
@@ -660,6 +706,10 @@ static esp_err_t page_get(httpd_req_t *req) {
 
 esp_err_t web_rescue_start(const web_rescue_cfg_t *cfg) {
   s_cfg = *cfg;
+  if (s_cfg.require_auth) {
+    web_auth_init();
+    web_auth_set_ap_exempt(true);
+  }
   esp_err_t err = wifi_up();
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "WiFi start failed: %s", esp_err_to_name(err));
@@ -671,6 +721,8 @@ esp_err_t web_rescue_start(const web_rescue_cfg_t *cfg) {
   hc.stack_size = 8192;
   hc.recv_wait_timeout = 30;
   hc.send_wait_timeout = 30;
+  // room for an Authorization header (the buffer only grows as needed)
+  hc.max_req_hdr_len = 2048;
   hc.lru_purge_enable = true;
   // fewer sessions than lwIP's TCP pool (CONFIG_LWIP_MAX_ACTIVE_TCP=6), so
   // a new client can still connect and LRU purge closes the oldest idle one
@@ -696,6 +748,12 @@ esp_err_t web_rescue_start(const web_rescue_cfg_t *cfg) {
     const httpd_uri_t root = {.uri = "/", .method = HTTP_GET,
                               .handler = page_get};
     httpd_register_uri_handler(s_httpd, &root);
+  }
+  if (cfg->require_auth) {
+    const httpd_uri_t pc = {.uri = "/api/password-clear",
+                            .method = HTTP_POST,
+                            .handler = password_clear_post};
+    httpd_register_uri_handler(s_httpd, &pc);
   }
   return ESP_OK;
 }

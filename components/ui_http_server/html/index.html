@@ -123,7 +123,8 @@
     async function checkDSPAvailability() {
       try {
         // Check DSP availability from general settings
-        const response = await fetch('/capabilities?tab=general');
+        const response = await fetch('/capabilities?tab=general', { headers: noLoginPrompt() });
+        // a 401 (login needed) leaves the tabs hidden, as any other failure
         if (!response.ok) {
           throw new Error('Failed to fetch capabilities');
         }
